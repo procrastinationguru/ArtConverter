@@ -8,6 +8,12 @@ REALESRGAN_MODEL = "4xNomos8kSC"  # best general-purpose pick from 3-model compa
 ARCANUM_ROOT = Path(r"D:\Galaxy\Games\Arcanum")
 DATA_OVERLAY_DIR = ARCANUM_ROOT / "data"
 
+# Loose RGB BMPs consumed directly by tig_video_set_hd_overlay() (SDL_LoadBMP,
+# not the game's palette-indexed ART/VFS path) - the native-res menu-background
+# spike. Path is relative to the game's cwd at runtime (ARCANUM_ROOT), matching
+# the literal "hd/MainMenuBack_hd.bmp" the engine currently hardcodes.
+HD_OVERLAY_DIR = ARCANUM_ROOT / "hd"
+
 # Loose, already-unpacked dat trees to search for source .ART files, in order.
 EXTRACTED_DAT_ROOTS = [
     ARCANUM_ROOT / "arcanum1",

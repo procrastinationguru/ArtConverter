@@ -211,6 +211,34 @@ def cmd_quantize(rel_path: str, keep_size: bool = False) -> None:
     print(f"Rescaled frame offsets in {ini_path.name} to match upscaled dimensions")
 
 
+def cmd_hd_overlay(rel_path: str) -> Path:
+    """Emit the full-resolution RGB BMP consumed directly by the engine's
+    native-resolution GPU spike (tig_video_set_hd_overlay(), loaded via plain
+    SDL_LoadBMP - not the palette-indexed ART/VFS path the rest of this
+    pipeline targets). No palette quantization, no downsampling: this is the
+    raw AI-upscaled frame, saved as-is.
+
+    Only meaningful for single-frame, full-screen background art (currently
+    just MainMenuBack) - the engine hook only ever reads frame 0, and only on
+    the mainmenu's fullscreen (4:3) background path. Run 'upscale' first.
+    """
+    wd = work_dir_for(rel_path)
+    bmps = frame_bmps(wd)
+    if not bmps:
+        raise RuntimeError(f"No frame BMPs found in {wd}; run 'unpack' first")
+    hd_png = bmps[0].with_name(bmps[0].stem + "_hd.png")
+    if not hd_png.exists():
+        raise RuntimeError(f"Missing {hd_png}; run 'upscale' first")
+
+    basename = Path(rel_path.replace("\\", "/")).with_suffix("").name
+    dest = config.HD_OVERLAY_DIR / f"{basename}_hd.bmp"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    Image.open(hd_png).convert("RGB").save(dest, "BMP")
+    print(f"Wrote HD overlay {hd_png.name} -> {dest}")
+    return dest
+
+
 def cmd_repack(rel_path: str) -> Path:
     wd = work_dir_for(rel_path)
     basename = wd / Path(rel_path).with_suffix("").name
@@ -255,7 +283,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("unpack", "upscale", "quantize", "repack", "deploy", "revert", "run"):
+    for name in ("unpack", "upscale", "quantize", "repack", "deploy", "revert", "hd-overlay", "run"):
         p = sub.add_parser(name)
         p.add_argument("rel_path", help="Path of the .ART relative to a dat root, e.g. art/interface/MainMenuBack.ART")
         if name in ("upscale", "run"):
@@ -290,6 +318,7 @@ def main() -> None:
         "repack": cmd_repack,
         "deploy": cmd_deploy,
         "revert": cmd_revert,
+        "hd-overlay": cmd_hd_overlay,
     }
     dispatch[args.command](args.rel_path)
 
