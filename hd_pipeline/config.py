@@ -20,6 +20,21 @@ EXTRACTED_DAT_ROOTS = [
     ARCANUM_ROOT / "arcanum2",
     ARCANUM_ROOT / "arcanum3",
     ARCANUM_ROOT / "Arcanum4",
+    ARCANUM_ROOT / "tig",  # tig.dat, unpacked 2026-09-20 - 17 .ART files (cursor/button/font chrome)
+    ARCANUM_ROOT / "modules" / "Vormantown",  # Vormantown.dat, unpacked 2026-09-20 - 0 .ART (townmap/slide BMPs only)
+]
+
+# Loose pre-rendered world/town-map BMPs (COLOR_LERP screen-tile path,
+# video.c:1007-1091 - a completely separate rendering pipeline from the
+# .ART/art_blit() system above, bypassing tig's art format entirely). Not
+# consumed by cmd_run()/EXTRACTED_DAT_ROOTS's .ART walk - these are plain
+# RGB/paletted BMPs read directly by whatever loads world-map/town-map
+# screens, so upscaling them is a straight image-replace, no unpack/quantize/
+# repack/ART-container round-trip needed. Two module trees exist:
+WORLDMAP_TOWNMAP_ROOTS = [
+    ARCANUM_ROOT / "modules" / "Arcanum" / "WorldMap",
+    ARCANUM_ROOT / "modules" / "Arcanum" / "townmap",
+    ARCANUM_ROOT / "modules" / "Vormantown" / "townmap",
 ]
 
 WORK_DIR = Path(__file__).parent / "work"
