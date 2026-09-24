@@ -1,3 +1,7 @@
 work
 category_lists
 comparison
+__pycache__/
+*.pyc
+*.log
+/upscayl-models/
