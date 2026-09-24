@@ -85,6 +85,28 @@ TOWNMAP_ROOTS = [
 ]
 TOWNMAP_OUTPUT_DIR = ARCANUM_ROOT / "hd" / "townmap"
 
+# WorldMap (overworld) - the OTHER WmapUiMode (wmap_ui.c: WORLD=0, CONTINENT=1,
+# TOWN=2), structurally the same row-major tile-grid system as townmap above,
+# just a single base-game map instead of 125 per-town/dungeon ones. Grid comes
+# straight from WorldMap.mes: "{50}{8, 8, SmallMapChunks, ZoomedName:
+# Map_Zoomed, MapKeyedTo: 1}" - confirmed against the real files (exactly 64
+# SmallMapChunks001..064.bmp on disk). No Vormantown WorldMap exists (that
+# module has no overworld - confirmed via find), so this is a single-map
+# command, not a batch driver like cmd_hd_townmap(). Tile naming is 1-indexed
+# "%s%03d" (wmap_ui.c:2718-2722: "%s%03d", field_68, tile + 1) - NOT
+# townmap's 0-indexed "%s%06d", so cmd_hd_worldmap_tiles() normalizes to
+# 0-indexed internally for the row/col grid math but writes output files back
+# under their original 1-indexed vanilla names.
+WORLDMAP_ROOT = _DAT_UNPACKED / "modules" / "Arcanum" / "Arcanum" / "WorldMap"
+WORLDMAP_GRID = (8, 8)  # (num_hor_tiles, num_vert_tiles)
+WORLDMAP_TILE_BASENAME = "SmallMapChunks"
+WORLDMAP_ZOOMED_BASENAME = "Map_Zoomed"
+# Output mirrors the engine's literal "WorldMap\\%s.bmp" path (wmTileArtLoad,
+# wmap_ui.c:2763) prefixed with "hd/", same "hd/<vanilla path>" convention as
+# townmap/portrait/movies - NOT the flat "hd/<name>_hd.bmp" convention slides/
+# splash/main-menu use (those go through tig_video_set_hd_overlay() instead).
+WORLDMAP_OUTPUT_DIR = ARCANUM_ROOT / "hd" / "WorldMap"
+
 # Story-slide BMPs shown by slide_ui.c between chapters / on death / credits -
 # plain loose 8-bit-palette BMPs (slide.mes: "slide\<name>.bmp"), not .ART
 # sprite sheets. slide_ui.c already tries the same flat "hd/<basename>_hd.bmp"

@@ -906,6 +906,120 @@ def cmd_hd_townmap(name: str | None = None, force: bool = False, model: str | No
     print(f"Townmap: {ok} done, {skipped_done} skipped (already done, use --force), {bad} failed")
 
 
+def cmd_hd_worldmap_tiles(esrgan_model: str) -> Path:
+    """Composite the overworld's SmallMapChunks grid into one image, upscale
+    once, slice back - the same composite-upscale-slice technique as
+    cmd_hd_townmap_one(), generalized to the single base-game overworld map
+    (config.WORLDMAP_GRID/ROOT/TILE_BASENAME, from WorldMap.mes). Avoids the
+    same independent-per-tile seam problem townmap had, for the same reason:
+    the model sees real neighbour pixels at every former tile boundary."""
+    root = config.WORLDMAP_ROOT
+    num_hor, _num_vert = config.WORLDMAP_GRID
+    basename = config.WORLDMAP_TILE_BASENAME
+
+    existing: dict[int, Path] = {}
+    tile_w = tile_h = None
+    for p in sorted(root.glob(f"{basename}*.bmp")):
+        m = re.fullmatch(re.escape(basename) + r"(\d{3})\.bmp", p.name)
+        if m is None:
+            continue
+        idx = int(m.group(1)) - 1  # vanilla filenames are 1-indexed; normalize to 0-indexed row-major
+        existing[idx] = p
+        if tile_w is None:
+            tile_w, tile_h = read_bmp_dims(p)
+            tile_h = abs(tile_h)
+
+    if not existing:
+        raise RuntimeError(f"no worldmap tile bmps found under {root}")
+
+    cols = [idx % num_hor for idx in existing]
+    rows = [idx // num_hor for idx in existing]
+    min_col, min_row = min(cols), min(rows)
+    grid_w = max(cols) - min_col + 1
+    grid_h = max(rows) - min_row + 1
+
+    composite = Image.new("RGB", (grid_w * tile_w, grid_h * tile_h))
+    for idx, p in existing.items():
+        col = idx % num_hor - min_col
+        row = idx // num_hor - min_row
+        composite.paste(Image.open(p).convert("RGB"), (col * tile_w, row * tile_h))
+
+    tmp_dir = config.WORK_DIR / "_worldmap_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    src_png = tmp_dir / "worldmap.png"
+    out_png = tmp_dir / "worldmap_hd.png"
+    composite.save(src_png)
+    run_esrgan(src_png, out_png, esrgan_model)
+
+    hd_composite = load_and_validate(out_png, (grid_w * tile_w * HD_SCALE, grid_h * tile_h * HD_SCALE), "realesrgan (worldmap composite)")
+
+    out_dir = config.WORLDMAP_OUTPUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for idx, p in existing.items():
+        col = idx % num_hor - min_col
+        row = idx // num_hor - min_row
+        box = (col * tile_w * HD_SCALE, row * tile_h * HD_SCALE,
+            (col + 1) * tile_w * HD_SCALE, (row + 1) * tile_h * HD_SCALE)
+        hd_composite.crop(box).save(out_dir / p.name, "BMP")
+
+    src_png.unlink(missing_ok=True)
+    out_png.unlink(missing_ok=True)
+
+    return out_dir
+
+
+def cmd_hd_worldmap_zoomed(esrgan_model: str) -> Path | None:
+    """Best-effort standalone upscale of Map_Zoomed.bmp (the single full-
+    overworld overview image, WorldMap.mes's ZoomedName key) - no composite
+    needed, it's already one image. Low priority: sub_565230 (wmap_ui.c)
+    blits it through a *scaling* tig_video_buffer_blit into a small on-screen
+    pane, so the extra source resolution here is close to imperceptible on
+    screen - included anyway since it's cheap and the machinery already
+    exists (same straight-ESRGAN pattern as cmd_hd_slides/cmd_hd_splash)."""
+    src = config.WORLDMAP_ROOT / f"{config.WORLDMAP_ZOOMED_BASENAME}.bmp"
+    if not src.is_file():
+        return None
+    tmp_dir = config.WORK_DIR / "_worldmap_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    src_png = tmp_dir / "zoomed.png"
+    out_png = tmp_dir / "zoomed_hd.png"
+    Image.open(src).convert("RGB").save(src_png)
+    run_esrgan(src_png, out_png, esrgan_model)
+    dest = config.WORLDMAP_OUTPUT_DIR / f"{config.WORLDMAP_ZOOMED_BASENAME}.bmp"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    Image.open(out_png).convert("RGB").save(dest, "BMP")
+    src_png.unlink(missing_ok=True)
+    out_png.unlink(missing_ok=True)
+    return dest
+
+
+def cmd_hd_worldmap(force: bool = False, model: str | None = None) -> None:
+    """Batch driver for the overworld: tiles + Map_Zoomed. Single base-game
+    map only - no separate Vormantown WorldMap exists (that module has no
+    overworld, confirmed via find), so unlike cmd_hd_townmap() this isn't a
+    per-town loop."""
+    esrgan_model = model or config.REALESRGAN_MODEL
+    log_name = "hd_worldmap"
+
+    if not force and load_done_set(log_name):
+        print("WorldMap: already done (use --force to regenerate)")
+        return
+
+    try:
+        tiles_dir = cmd_hd_worldmap_tiles(esrgan_model)
+        print(f"WorldMap tiles -> {tiles_dir.relative_to(config.HD_OVERLAY_DIR)}")
+        zoomed = cmd_hd_worldmap_zoomed(esrgan_model)
+        if zoomed:
+            print(f"WorldMap zoomed overview -> {zoomed.relative_to(config.HD_OVERLAY_DIR)}")
+        with open(batch_log_dir() / f"{log_name}.done.txt", "a", encoding="utf-8") as f:
+            f.write("WorldMap\n")
+        print("WorldMap: done")
+    except Exception as e:
+        print(f"WorldMap: FAILED: {e}")
+        with open(batch_log_dir() / f"{log_name}.failed.txt", "a", encoding="utf-8") as f:
+            f.write(f"WorldMap\t{e}\n")
+
+
 def cmd_hd_batch(category: str, model: str | None = None, limit: int | None = None, force: bool = False, file_list: Path | None = None, workers: int = 1) -> None:
     all_files = load_file_list(file_list) if file_list else find_category_files(category)
     if not all_files:
@@ -992,7 +1106,34 @@ def find_category_files(category: str) -> list[str]:
     deduped by rel_path (relative to its own root) in root-priority order -
     same resolution order find_source_art() itself uses, so a file present
     under multiple roots is only queued once.
+
+    Special pseudo-category "tig-root": loose *.ART sitting directly under
+    an art/ root (not inside any category subfolder) - e.g. tig.dat's
+    mouse.ART (the cursor) and 15 UI chrome files (button.ART, TileStamp.ART,
+    etc.). These are real, in-game-used ART files that every other category
+    batch silently skips, since they walk art/<category>/ subfolders only.
+    Excluded on purpose: BadArt.ART (arcanum1/art root, the missing-texture
+    placeholder - not worth converting) and morph15font.ART (a bitmap font
+    glyph sheet - fonts are explicitly deferred to the very end of the HD
+    pipeline work, handled together with the TTF project, not bundled in
+    here just because it happens to sit in the same loose-file root).
     """
+    _TIG_ROOT_EXCLUDE = {"BadArt.ART", "morph15font.ART"}
+    if category == "tig-root":
+        seen: set[str] = set()
+        rel_paths: list[str] = []
+        for root in config.EXTRACTED_DAT_ROOTS:
+            art_dir = root / "art"
+            if not art_dir.is_dir():
+                continue
+            for p in sorted(art_dir.iterdir()):
+                if p.is_file() and p.suffix.lower() == ".art" and p.name not in _TIG_ROOT_EXCLUDE:
+                    rel = p.relative_to(root).as_posix()
+                    if rel not in seen:
+                        seen.add(rel)
+                        rel_paths.append(rel)
+        return rel_paths
+
     seen: set[str] = set()
     rel_paths: list[str] = []
     for root in config.EXTRACTED_DAT_ROOTS:
@@ -1064,6 +1205,10 @@ def main() -> None:
     p_townmap.add_argument("--model", default=None, help="Force one ncnn model (default: config.REALESRGAN_MODEL)")
     p_townmap.add_argument("--force", action="store_true", help="Regenerate even if this town's hd/ output already exists")
 
+    p_worldmap = sub.add_parser("hd-worldmap", help="Composite the overworld's SmallMapChunks grid + Map_Zoomed, upscale, slice back to hd/WorldMap/")
+    p_worldmap.add_argument("--model", default=None, help="Force one ncnn model (default: config.REALESRGAN_MODEL)")
+    p_worldmap.add_argument("--force", action="store_true", help="Regenerate even if hd/WorldMap/ output already exists")
+
     p_hd = sub.add_parser("hd", help="Emit 4x RGBA PNG sidecars under hd/art/ for one .ART (rel_path) or a whole art/ category")
     p_hd.add_argument("target", help="art/<cat>/Name.ART rel_path, or a category folder name (interface, item, ...)")
     p_hd.add_argument("--model", default=None, help="Force one ncnn model for every frame (default: size-based pick)")
@@ -1103,6 +1248,10 @@ def main() -> None:
 
     if args.command == "hd-townmap":
         cmd_hd_townmap(name=args.name, force=args.force, model=args.model)
+        return
+
+    if args.command == "hd-worldmap":
+        cmd_hd_worldmap(force=args.force, model=args.model)
         return
 
 
