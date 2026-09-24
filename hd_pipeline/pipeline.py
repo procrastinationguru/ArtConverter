@@ -778,6 +778,134 @@ def cmd_hd(rel_path: str, model: str | None = None, force: bool = False, quiet: 
     return out_dir
 
 
+def cmd_hd_tile_selfwrap(model: str | None = None) -> None:
+    """Reprocess every ground `tile` ART (art/tile/*.ART, 1255 files, each a
+    single rotation/frame) using a self-wrap composite instead of the
+    independent per-file upscaling they already got earlier this session.
+    Ground tiles are a genuine self-repeating grid (SectorTileList.art_ids
+    [4096] - the same small texture really tiles against itself at runtime,
+    unlike wall/facade/roof's individually-placed objects), so tiling the
+    SAME source image 3x3, upscaling that composite once, and cropping just
+    the center cell gives the model real (self-)neighbour context on all
+    four edges - the same "avoid independent-file seam risk" reasoning as
+    the townmap/worldmap composite technique, just with a synthetic
+    self-composite instead of a real map layout.
+
+    ALWAYS overwrites hd/art/tile/<name>/r{rot}_f{frame}.png - this replaces
+    the earlier independent-upscale output, it does not skip-if-exists.
+    """
+    esrgan_model = model or config.REALESRGAN_MODEL
+    rel_paths = find_category_files("tile")
+    if not rel_paths:
+        raise RuntimeError("No .ART files found for art/tile/")
+
+    tmp_dir = config.WORK_DIR / "_tile_selfwrap_tmp"
+    if tmp_dir.is_dir():
+        shutil.rmtree(tmp_dir)
+    esrgan_in, esrgan_out = tmp_dir / "_esrgan_in", tmp_dir / "_esrgan_out"
+    cugan_in, cugan_out = tmp_dir / "_cugan_in", tmp_dir / "_cugan_out"
+    esrgan_in.mkdir(parents=True, exist_ok=True)
+    cugan_in.mkdir(parents=True, exist_ok=True)
+
+    # Pass 1: unpack every tile, inpaint its single frame, build the 3x3
+    # self-wrap composite, stage it for one combined batch upscale (same
+    # directory-mode-avoids-per-launch-setup-cost reasoning as cmd_hd()'s
+    # per-file batching - see run_esrgan_batch's comment - just spanning all
+    # 1255 files' frames in one go instead of one file's rotations).
+    metas = []
+    print(f"Tile self-wrap: staging {len(rel_paths)} tile(s)...", flush=True)
+    for rel_path in rel_paths:
+        wd = cmd_unpack(rel_path, quiet=True)
+        basename = Path(rel_path.replace("\\", "/")).name.rsplit(".", 1)[0]
+        ini_path = wd / (basename + ".ini")
+        num_frames, animated = read_ini_frame_count(ini_path)
+        frames = hd_frame_bmps(wd, basename, num_frames, animated)
+
+        force_cugan = rel_path.replace("\\", "/") in config.FORCE_CUGAN_ASSETS
+        for rot, frame, bmp in frames:
+            w, h = read_bmp_dims(bmp)
+            h = abs(h)
+            indices = np.asarray(read_bmp_indices(bmp), dtype=np.uint8).reshape(h, w)
+            palette = np.asarray(read_bmp_palette(bmp), dtype=np.uint8).reshape(256, 3)
+            key = indices == 0
+            rgb = palette[indices]
+            src_rgb = np.clip(inpaint_colorkey(rgb, key), 0, 255).astype(np.uint8)
+
+            tiled = np.tile(src_rgb, (3, 3, 1))
+            is_small = w * h < HD_SMALL_FRAME_PX * HD_SMALL_FRAME_PX
+            route = "cugan" if (force_cugan or is_small) else "esrgan"
+            key_name = f"{basename}_r{rot}_f{frame}.png"
+            staging_dir = cugan_in if route == "cugan" else esrgan_in
+            Image.fromarray(tiled, "RGB").save(staging_dir / key_name)
+
+            metas.append(dict(
+                rel_path=rel_path, rot=rot, frame=frame, w=w, h=h, key=key,
+                route=route, key_name=key_name, bmp=bmp,
+            ))
+
+    if any(m["route"] == "esrgan" for m in metas):
+        n = sum(1 for m in metas if m["route"] == "esrgan")
+        print(f"Tile self-wrap: running realesrgan batch on {n} composite(s)...", flush=True)
+        run_esrgan_batch(esrgan_in, esrgan_out, esrgan_model)
+    if any(m["route"] == "cugan" for m in metas):
+        n = sum(1 for m in metas if m["route"] == "cugan")
+        print(f"Tile self-wrap: running realcugan batch on {n} composite(s)...", flush=True)
+        run_realcugan_batch(cugan_in, cugan_out)
+
+    # Pass 2: crop the center cell out of each upscaled composite, apply
+    # alpha from the single tile's own colour-key mask (same hq4x technique
+    # as cmd_hd() - the mask only needs the real tile's own edges, not the
+    # synthetic self-wrap composite), always overwrite the existing output.
+    ok = bad = 0
+    for i, m in enumerate(metas, 1):
+        rel_path, rot, frame, w, h, key, route, key_name, bmp = (
+            m["rel_path"], m["rot"], m["frame"], m["w"], m["h"], m["key"], m["route"], m["key_name"], m["bmp"],
+        )
+        expected_tiled_size = (w * 3 * HD_SCALE, h * 3 * HD_SCALE)
+        try:
+            if route == "cugan":
+                hd_tiled = load_and_validate(cugan_out / key_name, expected_tiled_size, "realcugan batch (tile self-wrap)")
+                if is_blank_output(hd_tiled):
+                    retry_png = (cugan_in / key_name).with_name(Path(key_name).stem + "_retry.png")
+                    run_realcugan(cugan_in / key_name, retry_png)
+                    hd_tiled = load_and_validate(retry_png, expected_tiled_size, "realcugan retry (tile self-wrap)")
+                    if is_blank_output(hd_tiled):
+                        raise RuntimeError(f"realcugan produced blank output twice for {bmp}")
+            else:
+                hd_tiled = load_and_validate(esrgan_out / key_name, expected_tiled_size, "realesrgan batch (tile self-wrap)")
+                if is_blank_output(hd_tiled):
+                    retry_png = (esrgan_in / key_name).with_name(Path(key_name).stem + "_retry.png")
+                    run_esrgan(esrgan_in / key_name, retry_png, esrgan_model)
+                    hd_tiled = load_and_validate(retry_png, expected_tiled_size, "realesrgan retry (tile self-wrap)")
+                    if is_blank_output(hd_tiled):
+                        raise RuntimeError(f"realesrgan produced blank output twice for {bmp}")
+
+            box = (w * HD_SCALE, h * HD_SCALE, 2 * w * HD_SCALE, 2 * h * HD_SCALE)
+            hd = hd_tiled.crop(box)
+
+            mask_rgb = Image.fromarray(np.where(key, 0, 255).astype(np.uint8), "L").convert("RGB")
+            alpha_rgb = hqx.hq4x(mask_rgb)
+            expected_size = (w * HD_SCALE, h * HD_SCALE)
+            if alpha_rgb.size != expected_size:
+                raise RuntimeError(f"hq4x produced wrong size {alpha_rgb.size} for {bmp} (expected {expected_size})")
+            alpha = alpha_rgb.convert("L")
+            rgba = hd.copy()
+            rgba.putalpha(alpha)
+
+            out_dir = hd_out_dir(rel_path)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            dest = out_dir / f"r{rot}_f{frame}.png"
+            rgba.save(dest, "PNG", optimize=True)
+            ok += 1
+            print(f"[{i}/{len(metas)}] {rel_path} -> {dest.relative_to(config.HD_OVERLAY_DIR)}", flush=True)
+        except Exception as e:
+            bad += 1
+            print(f"[{i}/{len(metas)}] FAILED: {rel_path}: {e}", flush=True)
+
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    print(f"Tile self-wrap: {ok} succeeded, {bad} failed out of {len(metas)}.", flush=True)
+
+
 def read_townmap_info(tmi_path: Path) -> dict:
     """Parse a 48-byte TownMapInfo (arcanum-ce src/game/townmap.h): 8x int32,
     then int64 loc, float32 scale, int32 padding. Confirmed against Ashbury's
@@ -1209,6 +1337,9 @@ def main() -> None:
     p_worldmap.add_argument("--model", default=None, help="Force one ncnn model (default: config.REALESRGAN_MODEL)")
     p_worldmap.add_argument("--force", action="store_true", help="Regenerate even if hd/WorldMap/ output already exists")
 
+    p_tile_selfwrap = sub.add_parser("hd-tile-selfwrap", help="Reprocess ground tiles with a 3x3 self-wrap composite (fixes independent-upscale seam risk); ALWAYS overwrites hd/art/tile/")
+    p_tile_selfwrap.add_argument("--model", default=None, help="Force one ncnn model (default: config.REALESRGAN_MODEL)")
+
     p_hd = sub.add_parser("hd", help="Emit 4x RGBA PNG sidecars under hd/art/ for one .ART (rel_path) or a whole art/ category")
     p_hd.add_argument("target", help="art/<cat>/Name.ART rel_path, or a category folder name (interface, item, ...)")
     p_hd.add_argument("--model", default=None, help="Force one ncnn model for every frame (default: size-based pick)")
@@ -1252,6 +1383,10 @@ def main() -> None:
 
     if args.command == "hd-worldmap":
         cmd_hd_worldmap(force=args.force, model=args.model)
+        return
+
+    if args.command == "hd-tile-selfwrap":
+        cmd_hd_tile_selfwrap(model=args.model)
         return
 
 
