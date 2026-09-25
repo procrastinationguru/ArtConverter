@@ -1547,7 +1547,7 @@ def flood_from_border(candidate: np.ndarray) -> np.ndarray:
         region = grown
 
 
-def cmd_hd_compose(only: str | None = None, model: str | None = None) -> None:
+def cmd_hd_compose(only: str | None = None, model: str | None = None, dry_run: bool = False) -> None:
     """Rebuild every captured interface frame's sidecar from an in-context
     upscale (see the block comment above). The first run keeps each frame's
     previous sidecar in work/_compose_originals/; frames without a usable
@@ -1617,6 +1617,10 @@ def cmd_hd_compose(only: str | None = None, model: str | None = None) -> None:
             match &= ~hole[oy:oy + h, ox:ox + w]
             self_match = match.sum() / max(1, fo.sum())
             margin = min(ox, oy, cw - ox - w, ch - oy - h)
+            # No context on any side (a full-window background): nothing to
+            # compose against - its own upscale already is the whole screen.
+            if max(ox, oy, cw - ox - w, ch - oy - h) == 0:
+                continue
             score = (self_match > COMPOSE_SELF_MATCH_LIMIT, -margin)
             if best is None or score < best[0]:
                 best = (score, c, under, fr, fo, match, self_match, ox, oy)
@@ -1633,8 +1637,11 @@ def cmd_hd_compose(only: str | None = None, model: str | None = None) -> None:
         jobs.append(dict(rel=rel, rot=rot, frame=frame, w=w, h=h, ox=ox, oy=oy, flags=c["flags"],
                          keep=fo & ~matte, name=name, comp_size=comp.shape[:2]))
 
-    if not jobs:
-        print(f"hd-compose: nothing to do ({skipped} captured frame(s) without a usable placement)")
+    if not jobs or dry_run:
+        arts = len({j["rel"] for j in jobs})
+        partial = sum(1 for j in jobs if not j["keep"].all())
+        print(f"hd-compose{' (dry run)' if dry_run else ''}: {len(jobs)} frame(s) of {arts} art(s) usable, "
+              f"{partial} with transparent parts, {skipped} captured frame(s) without a usable placement")
         return
 
     print(f"hd-compose: upscaling {len(jobs)} composite(s) with {esrgan_model}...")
@@ -1703,6 +1710,7 @@ def main() -> None:
     p_compose = sub.add_parser("hd-compose", help="Rebuild captured interface sidecars by compose -> upscale -> decompose over their real underlays (game's hd_capture/, see arcanum-ce tig_window_hd_capture)")
     p_compose.add_argument("--only", default=None, help="Only arts whose path contains this text")
     p_compose.add_argument("--model", default=None, help="Force one ncnn model (default: config.REALESRGAN_MODEL)")
+    p_compose.add_argument("--dry-run", action="store_true", help="Only report which captured frames are usable")
 
     sub.add_parser("hd-background-matte", help="Replace the background baked into PC-lens-style pieces with the HD background crop (see BACKGROUND_MATTE_PIECES)")
 
@@ -1756,7 +1764,7 @@ def main() -> None:
         return
 
     if args.command == "hd-compose":
-        cmd_hd_compose(only=args.only, model=args.model)
+        cmd_hd_compose(only=args.only, model=args.model, dry_run=args.dry_run)
         return
 
     if args.command == "hd-background-matte":
