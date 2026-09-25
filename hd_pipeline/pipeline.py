@@ -1484,30 +1484,65 @@ def cmd_hd_background_matte() -> None:
 # The engine (arcanum-ce, window.c tig_window_hd_capture) writes
 # <game>/hd_capture/manifest.txt plus one BMP per placement when a
 # hd_capture/ folder exists: the window's 1x pixels under each interface
-# frame (16 px margin) the first time it's blitted at a position. Here each
-# captured frame is composed over that underlay, the composite is upscaled
-# (in context: ESRGAN sees the ring against the wood it's drawn on, instead
-# of a lone sprite against an inpainted edge colour), and the frame is cut
-# back out of the upscale. Pixels of the frame that are really the
-# background baked into the art (flood-filled from the frame border across
-# pixels equal to the underlay, like hd-background-matte) become
-# transparent, so the HD background shows through there.
+# frame (16 px margin) the first time it's blitted at a position. Every run
+# first merges that folder into work/_captures/ (so the game folder can be
+# wiped between sessions without losing anything), then each captured frame
+# is composed over its underlay and the composite is upscaled in context
+# (ESRGAN sees the ring against what it's drawn on, instead of a lone sprite
+# against an inpainted edge colour). The frame is cut back out of the
+# upscale with an alpha that is itself an ESRGAN upscale of the frame's mask
+# (smooth curves, unlike hq4x's 45-degree-only smoothing).
+#
+# Frames up to COMPOSE_DOUBLE_MAX px go through the upscaler twice (16x) and
+# are Lanczos-downsampled back to 4x: at 4x the source's 1 px stair steps are
+# 4 px features the second pass turns into real curves, so rings and round
+# buttons come out round (playtest round 5).
+#
+# No background matte here: making frame pixels that equal their capture's
+# underlay transparent broke every button whose states are drawn over each
+# other (stuck hover frames, invisible click frames). Pieces that need it
+# are handled by hd-background-matte (BACKGROUND_MATTE_PIECES) and skipped.
 
 HD_CAPTURE_DIR = config.ARCANUM_ROOT / "hd_capture"
-COMPOSE_MATTE_TOLERANCE = 12
-# A frame matching its underlay over more than this share of its opaque
-# pixels was drawn over itself (a redraw) - no matte from that placement.
-COMPOSE_SELF_MATCH_LIMIT = 0.5
+CAPTURE_ARCHIVE_DIR = config.WORK_DIR / "_captures"
+COMPOSE_DOUBLE_MAX = 160
+COMPOSE_MASK_EDGE = (0.3, 0.7)
 BLT_FLIP_X = 0x1
 BLT_FLIP_Y = 0x2
 WINDOW_TRANSPARENT = 0x1
 
 
+def sync_capture_archive() -> Path:
+    """Merge <game>/hd_capture/ into work/_captures/; returns the archive's
+    manifest path."""
+    CAPTURE_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    archive_manifest = CAPTURE_ARCHIVE_DIR / "manifest.txt"
+    lines = archive_manifest.read_text(errors="replace").splitlines() if archive_manifest.is_file() else []
+    known = set(lines)
+    added = copied = 0
+    live_manifest = HD_CAPTURE_DIR / "manifest.txt"
+    if live_manifest.is_file():
+        for bmp in HD_CAPTURE_DIR.glob("*.bmp"):
+            dest = CAPTURE_ARCHIVE_DIR / bmp.name
+            if not dest.exists() or dest.stat().st_size != bmp.stat().st_size:
+                shutil.copyfile(bmp, dest)
+                copied += 1
+        for line in live_manifest.read_text(errors="replace").splitlines():
+            if line and line not in known:
+                known.add(line)
+                lines.append(line)
+                added += 1
+        archive_manifest.write_text("".join(line + "\n" for line in lines))
+    print(f"captures: {len(lines)} placement line(s) archived in {CAPTURE_ARCHIVE_DIR} (+{added} lines, {copied} BMPs from {HD_CAPTURE_DIR})")
+    return archive_manifest
+
+
 def read_capture_manifest() -> dict[tuple[str, int, int], list[dict]]:
-    """{(art rel_path, rot, frame): [placement, ...]} in capture order."""
-    manifest = HD_CAPTURE_DIR / "manifest.txt"
+    """{(art rel_path, rot, frame): [placement, ...]} in capture order, from
+    the merged archive (see sync_capture_archive)."""
+    manifest = sync_capture_archive()
     if not manifest.is_file():
-        raise RuntimeError(f"No capture manifest at {manifest} - create {HD_CAPTURE_DIR} and play the screens first")
+        raise RuntimeError(f"No captures yet - create {HD_CAPTURE_DIR} and play the screens first")
 
     def rect(s: str) -> tuple[int, int, int, int]:
         x, y, w, h = (int(v) for v in s.split(","))
@@ -1522,29 +1557,10 @@ def read_capture_manifest() -> dict[tuple[str, int, int], list[dict]]:
         rel = art.replace("\\", "/")
         key = int(win_key, 16) if int(win_flags, 16) & WINDOW_TRANSPARENT else None
         out.setdefault((rel, int(rot), int(frame)), []).append(dict(
-            flags=int(flags, 16), src=rect(src), dst=rect(dst), cap=rect(cap), bmp=HD_CAPTURE_DIR / bmp,
+            flags=int(flags, 16), src=rect(src), dst=rect(dst), cap=rect(cap), bmp=CAPTURE_ARCHIVE_DIR / bmp,
             key=None if key is None else ((key >> 16) & 255, (key >> 8) & 255, key & 255),
         ))
     return out
-
-
-def flood_from_border(candidate: np.ndarray) -> np.ndarray:
-    """4-neighbour flood fill of `candidate` from the array border."""
-    region = np.zeros_like(candidate)
-    region[0, :] = candidate[0, :]
-    region[-1, :] = candidate[-1, :]
-    region[:, 0] |= candidate[:, 0]
-    region[:, -1] |= candidate[:, -1]
-    while True:
-        grown = region.copy()
-        grown[1:, :] |= region[:-1, :]
-        grown[:-1, :] |= region[1:, :]
-        grown[:, 1:] |= region[:, :-1]
-        grown[:, :-1] |= region[:, 1:]
-        grown &= candidate
-        if np.array_equal(grown, region):
-            return region
-        region = grown
 
 
 def cmd_hd_compose(only: str | None = None, model: str | None = None, dry_run: bool = False) -> None:
@@ -1554,18 +1570,20 @@ def cmd_hd_compose(only: str | None = None, model: str | None = None, dry_run: b
     capture are left alone."""
     placements = read_capture_manifest()
     esrgan_model = model or config.REALESRGAN_MODEL
-    stage_in = config.WORK_DIR / "_compose_in"
-    stage_out = config.WORK_DIR / "_compose_out"
-    for d in (stage_in, stage_out):
-        if d.exists():
-            shutil.rmtree(d)
-        d.mkdir(parents=True)
+    matte_pieces = {piece.replace("\\", "/").lower() for piece, _, _ in BACKGROUND_MATTE_PIECES}
+    stage = config.WORK_DIR / "_compose"
+    if stage.exists():
+        shutil.rmtree(stage)
+    stage_in = stage / "in"
+    stage_in.mkdir(parents=True)
 
     frames_by_art: dict[str, dict[tuple[int, int], Path]] = {}
     jobs = []
     skipped = 0
     for (rel, rot, frame), cands in sorted(placements.items()):
         if only is not None and only.lower() not in rel.lower():
+            continue
+        if rel.lower() in matte_pieces:
             continue
         if rel not in frames_by_art:
             wd = cmd_unpack(rel, quiet=True)
@@ -1584,6 +1602,7 @@ def cmd_hd_compose(only: str | None = None, model: str | None = None, dry_run: b
         rgb = palette[indices]
         opaque = indices != 0
 
+        # The placement with the most context around the frame.
         best = None
         for c in cands:
             sx, sy, sw, sh = c["src"]
@@ -1593,69 +1612,89 @@ def cmd_hd_compose(only: str | None = None, model: str | None = None, dry_run: b
                 continue
             if dx < cx or dy < cy or dx + w > cx + cw or dy + h > cy + ch or not c["bmp"].is_file():
                 continue
-            under = np.asarray(Image.open(c["bmp"]).convert("RGB"))
-            if under.shape[:2] != (ch, cw):
-                continue
-            # Transparent window: its colour key means "nothing drawn here" -
-            # replace with the nearest real colour so it never bleeds in, and
-            # keep it out of the matte (inpainted pixels never equal art).
-            hole = np.zeros(under.shape[:2], dtype=bool)
-            if c["key"] is not None:
-                hole = np.all(under == np.array(c["key"], dtype=np.uint8), axis=2)
-                if hole.all():
-                    under = np.zeros_like(under)
-                elif hole.any():
-                    under = np.clip(inpaint_colorkey(under, hole) + 0.5, 0, 255).astype(np.uint8)
-            fr, fo = rgb, opaque
-            if c["flags"] & BLT_FLIP_X:
-                fr, fo = fr[:, ::-1], fo[:, ::-1]
-            if c["flags"] & BLT_FLIP_Y:
-                fr, fo = fr[::-1], fo[::-1]
             ox, oy = dx - cx, dy - cy
-            under_at = under[oy:oy + h, ox:ox + w]
-            match = (np.abs(under_at.astype(int) - fr.astype(int)).max(axis=2) <= COMPOSE_MATTE_TOLERANCE) & fo
-            match &= ~hole[oy:oy + h, ox:ox + w]
-            self_match = match.sum() / max(1, fo.sum())
-            margin = min(ox, oy, cw - ox - w, ch - oy - h)
+            sides = (ox, oy, cw - ox - w, ch - oy - h)
             # No context on any side (a full-window background): nothing to
             # compose against - its own upscale already is the whole screen.
-            if max(ox, oy, cw - ox - w, ch - oy - h) == 0:
+            if max(sides) == 0:
                 continue
-            score = (self_match > COMPOSE_SELF_MATCH_LIMIT, -margin)
-            if best is None or score < best[0]:
-                best = (score, c, under, fr, fo, match, self_match, ox, oy)
+            score = (min(sides), sum(sides))
+            if best is None or score > best[0]:
+                best = (score, c, ox, oy)
         if best is None:
             skipped += 1
             continue
 
-        _, c, under, fr, fo, match, self_match, ox, oy = best
+        _, c, ox, oy = best
+        cx, cy, cw, ch = c["cap"]
+        under = np.asarray(Image.open(c["bmp"]).convert("RGB"))
+        if under.shape[:2] != (ch, cw):
+            skipped += 1
+            continue
+        # Transparent window: its colour key means "nothing drawn here" -
+        # replace with the nearest real colour so it never bleeds in.
+        if c["key"] is not None:
+            hole = np.all(under == np.array(c["key"], dtype=np.uint8), axis=2)
+            if hole.all():
+                under = np.zeros_like(under)
+            elif hole.any():
+                under = np.clip(inpaint_colorkey(under, hole) + 0.5, 0, 255).astype(np.uint8)
+
+        fr, fo = rgb, opaque
+        if c["flags"] & BLT_FLIP_X:
+            fr, fo = fr[:, ::-1], fo[:, ::-1]
+        if c["flags"] & BLT_FLIP_Y:
+            fr, fo = fr[::-1], fo[::-1]
+
         comp = under.copy()
         comp[oy:oy + h, ox:ox + w][fo] = fr[fo]
-        name = f"{len(jobs):05d}.png"
-        Image.fromarray(comp, "RGB").save(stage_in / name)
-        matte = flood_from_border(match | ~fo) & fo if self_match <= COMPOSE_SELF_MATCH_LIMIT else np.zeros_like(fo)
+        mask = np.zeros(under.shape[:2], dtype=np.uint8)
+        mask[oy:oy + h, ox:ox + w][fo] = 255
+
+        group = "double" if max(w, h) <= COMPOSE_DOUBLE_MAX else "single"
+        idx = len(jobs)
+        (stage_in / group).mkdir(exist_ok=True)
+        Image.fromarray(comp, "RGB").save(stage_in / group / f"{idx:05d}_c.png")
+        Image.fromarray(mask, "L").convert("RGB").save(stage_in / group / f"{idx:05d}_m.png")
         jobs.append(dict(rel=rel, rot=rot, frame=frame, w=w, h=h, ox=ox, oy=oy, flags=c["flags"],
-                         keep=fo & ~matte, name=name, comp_size=comp.shape[:2]))
+                         idx=idx, group=group, comp_size=comp.shape[:2]))
 
     if not jobs or dry_run:
         arts = len({j["rel"] for j in jobs})
-        partial = sum(1 for j in jobs if not j["keep"].all())
-        print(f"hd-compose{' (dry run)' if dry_run else ''}: {len(jobs)} frame(s) of {arts} art(s) usable, "
-              f"{partial} with transparent parts, {skipped} captured frame(s) without a usable placement")
+        doubles = sum(1 for j in jobs if j["group"] == "double")
+        print(f"hd-compose{' (dry run)' if dry_run else ''}: {len(jobs)} frame(s) of {arts} art(s) usable "
+              f"({doubles} small enough for the 16x pass), {skipped} captured frame(s) without a usable placement")
         return
 
-    print(f"hd-compose: upscaling {len(jobs)} composite(s) with {esrgan_model}...")
-    run_esrgan_batch(stage_in, stage_out, esrgan_model)
+    print(f"hd-compose: upscaling {len(jobs)} composite(s) + masks with {esrgan_model}...")
+    for group in ("single", "double"):
+        if (stage_in / group).is_dir():
+            run_esrgan_batch(stage_in / group, stage / f"{group}_x4", esrgan_model)
+    if (stage_in / "double").is_dir():
+        print("hd-compose: second pass (16x) for small frames...")
+        run_esrgan_batch(stage / "double_x4", stage / "double_x16", esrgan_model)
 
     backup_root = config.WORK_DIR / "_compose_originals"
     s = HD_SCALE
+    lo, hi = COMPOSE_MASK_EDGE
     for j in jobs:
         ch, cw = j["comp_size"]
-        hd = np.asarray(load_and_validate(stage_out / j["name"], (cw * s, ch * s), "hd-compose").convert("RGB"))
-        crop = hd[j["oy"] * s:(j["oy"] + j["h"]) * s, j["ox"] * s:(j["ox"] + j["w"]) * s]
-        mask_rgb = Image.fromarray(np.where(j["keep"], 255, 0).astype(np.uint8), "L").convert("RGB")
-        alpha = smooth_alpha(np.asarray(hqx.hq4x(mask_rgb).convert("L")) / 255.0)
-        rgba = np.dstack([crop, np.clip(alpha * 255.0 + 0.5, 0, 255).astype(np.uint8)])
+        size4 = (cw * s, ch * s)
+
+        def load(kind: str) -> Image.Image:
+            name = f"{j['idx']:05d}_{kind}.png"
+            if j["group"] == "double":
+                im = load_and_validate(stage / "double_x16" / name, (cw * s * s, ch * s * s), "hd-compose x16")
+                return im.resize(size4, Image.LANCZOS)
+            return load_and_validate(stage / "single_x4" / name, size4, "hd-compose")
+
+        hd = np.asarray(load("c").convert("RGB"))
+        m4 = np.asarray(load("m").convert("L"), dtype=np.float32) / 255.0
+        y0, y1 = j["oy"] * s, (j["oy"] + j["h"]) * s
+        x0, x1 = j["ox"] * s, (j["ox"] + j["w"]) * s
+        t = np.clip((m4[y0:y1, x0:x1] - lo) / (hi - lo), 0.0, 1.0)
+        alpha = t * t * (3.0 - 2.0 * t)
+        rgba = np.dstack([hd[y0:y1, x0:x1], np.clip(alpha * 255.0 + 0.5, 0, 255).astype(np.uint8)])
         # Back to the frame's own orientation (the capture was drawn flipped).
         if j["flags"] & BLT_FLIP_X:
             rgba = rgba[:, ::-1]
