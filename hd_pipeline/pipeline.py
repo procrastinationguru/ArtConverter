@@ -213,12 +213,53 @@ def verify_batch(src_dir: Path, dest_dir: Path, redo) -> None:
         print(f"  {redone} corrupt batch output(s) in {dest_dir.name} redone single-file")
 
 
-def run_esrgan_batch(src_dir: Path, dest_dir: Path, model: str) -> None:
+# The corruption follows small inputs: with every input edge-padded to at
+# least this many px (outputs cropped back), the x16 trial batch that broke
+# 15 of 49 frames came out clean - and the overnight scenery fix had most of
+# its 222 frames redone single-file (~1.5 s each) before this.
+BATCH_MIN_SIDE = 64
+
+
+def run_padded_batch(src_dir: Path, dest_dir: Path, args_for) -> None:
+    """Run one ncnn directory-mode upscale of src_dir into dest_dir with
+    every input padded to BATCH_MIN_SIDE (replicated edges) and each output
+    cropped back to 4x its input. args_for(in_dir, out_dir) -> argv."""
     dest_dir.mkdir(parents=True, exist_ok=True)
-    args = [str(config.REALESRGAN_EXE), "-i", str(src_dir), "-o", str(dest_dir), "-s", str(HD_SCALE), "-n", model]
-    result = subprocess.run(args, capture_output=True, text=True)
+    pad_in = dest_dir.parent / (dest_dir.name + "_padin")
+    pad_out = dest_dir.parent / (dest_dir.name + "_padout")
+    for d in (pad_in, pad_out):
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
+    sizes: dict[str, tuple[int, int]] = {}
+    for src in src_dir.glob("*.png"):
+        with Image.open(src) as im:
+            w, h = im.size
+            if w >= BATCH_MIN_SIDE and h >= BATCH_MIN_SIDE:
+                shutil.copyfile(src, pad_in / src.name)
+                continue
+            arr = np.asarray(im.convert("RGB"))
+        sizes[src.name] = (w, h)
+        arr = np.pad(arr, ((0, max(0, BATCH_MIN_SIDE - h)), (0, max(0, BATCH_MIN_SIDE - w)), (0, 0)), mode="edge")
+        Image.fromarray(arr, "RGB").save(pad_in / src.name)
+    result = subprocess.run(args_for(pad_in, pad_out), capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"realesrgan batch failed on {src_dir}:\n{result.stdout}\n{result.stderr}")
+        raise RuntimeError(f"ncnn batch failed on {src_dir}:\n{result.stdout}\n{result.stderr}")
+    for out in pad_out.glob("*.png"):
+        if out.name in sizes:
+            w, h = sizes[out.name]
+            with Image.open(out) as im:
+                im.crop((0, 0, w * HD_SCALE, h * HD_SCALE)).save(dest_dir / out.name)
+        else:
+            shutil.move(str(out), str(dest_dir / out.name))
+    shutil.rmtree(pad_in, ignore_errors=True)
+    shutil.rmtree(pad_out, ignore_errors=True)
+
+
+def run_esrgan_batch(src_dir: Path, dest_dir: Path, model: str) -> None:
+    run_padded_batch(src_dir, dest_dir, lambda i, o: [
+        str(config.REALESRGAN_EXE), "-i", str(i), "-o", str(o), "-s", str(HD_SCALE), "-n", model,
+    ])
     verify_batch(src_dir, dest_dir, lambda s, d: run_esrgan(s, d, model))
 
 
@@ -226,14 +267,10 @@ def run_esrgan_batch(src_dir: Path, dest_dir: Path, model: str) -> None:
 # black, even another input's image under this name) for most frames of a
 # mixed-size batch - 47 of 49 in the x16 trial - and still exits 0.
 def run_realcugan_batch(src_dir: Path, dest_dir: Path) -> None:
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    args = [
-        str(config.REALCUGAN_EXE), "-i", str(src_dir), "-o", str(dest_dir),
+    run_padded_batch(src_dir, dest_dir, lambda i, o: [
+        str(config.REALCUGAN_EXE), "-i", str(i), "-o", str(o),
         "-s", str(HD_SCALE), "-n", "-1", "-m", str(config.REALCUGAN_MODEL_DIR), "-j", "1:1:1",
-    ]
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"realcugan batch failed on {src_dir}:\n{result.stdout}\n{result.stderr}")
+    ])
     verify_batch(src_dir, dest_dir, run_realcugan)
 
 
