@@ -1309,6 +1309,113 @@ def load_file_list(list_path: Path) -> list[str]:
     return lines
 
 
+# Interface pieces whose vanilla art has a copy of the background they sit
+# on baked into their opaque corners (the PC-lens rings: square art, round
+# ring, wood outside it). Upscaled on their own, those corners come out as a
+# blurrier, differently-coloured square that no longer matches the (also
+# upscaled) background around them - playtest round 4 #62. (piece, the
+# background it is drawn on, top-left of the piece in that background)
+BACKGROUND_MATTE_PIECES = [
+    ("art/interface/SaveLoadPCLens.ART", "art/interface/SaveLoadBackground.ART", (84, 10)),
+    ("art/interface/OptionsPCLens.ART", "art/interface/OptionsMenuBack.ART", (84, 67)),
+]
+
+# Max per-channel difference for "this piece pixel is background": the
+# piece re-quantized the same wood to its own palette (measured <= 6).
+BACKGROUND_MATTE_TOLERANCE = 12
+BACKGROUND_MATTE_EDGE_TOLERANCE = 48
+
+# HD pixels over which the swapped-in background fades into the piece's own
+# upscale at the seam (4x space).
+BACKGROUND_MATTE_FEATHER = 3
+
+
+def vanilla_frame_rgb(rel_path: str) -> tuple[np.ndarray, np.ndarray]:
+    """(rgb HxWx3, palette indices HxW) of frame 0 of a vanilla .ART."""
+    wd = cmd_unpack(rel_path, quiet=True)
+    bmp = frame_bmps(wd)[0]
+    w, h = read_bmp_dims(bmp)
+    h = abs(h)
+    palette = np.array(read_bmp_palette(bmp), dtype=np.uint8).reshape(256, 3)
+    indices = np.array(read_bmp_indices(bmp), dtype=np.uint8).reshape(h, w)
+    return palette[indices], indices
+
+
+def cmd_hd_background_matte() -> None:
+    """Combine -> upscale -> decompose, for the background part only: the
+    region of each BACKGROUND_MATTE_PIECES piece that is really background
+    (flood-filled from the piece's border across pixels matching the vanilla
+    background within tolerance, so it stops at the ring) is replaced in the
+    piece's HD sidecar by the matching crop of the background's HD sidecar.
+    The HD background is one upscale of the whole screen, so the corners
+    then line up with it exactly. Overwrites hd/art/<piece>/r0_f0.png; the
+    first run keeps the original upscale in work/_matte_originals/ and every
+    run starts from that, so it is safe to rerun."""
+    for piece_rel, bg_rel, (ox, oy) in BACKGROUND_MATTE_PIECES:
+        piece_rgb, piece_idx = vanilla_frame_rgb(piece_rel)
+        bg_rgb, _ = vanilla_frame_rgb(bg_rel)
+        ph, pw = piece_idx.shape
+
+        diff = np.abs(bg_rgb[oy:oy + ph, ox:ox + pw].astype(int) - piece_rgb.astype(int)).max(axis=2)
+        candidate = (diff <= BACKGROUND_MATTE_TOLERANCE) & (piece_idx != 0)
+
+        # Flood fill from the border through candidate pixels (4-neighbour).
+        region = np.zeros_like(candidate)
+        region[0, :] = candidate[0, :]
+        region[-1, :] = candidate[-1, :]
+        region[:, 0] |= candidate[:, 0]
+        region[:, -1] |= candidate[:, -1]
+        while True:
+            grown = region.copy()
+            grown[1:, :] |= region[:-1, :]
+            grown[:-1, :] |= region[1:, :]
+            grown[:, 1:] |= region[:, :-1]
+            grown[:, :-1] |= region[:, 1:]
+            grown &= candidate
+            if np.array_equal(grown, region):
+                break
+            region = grown
+
+        # One more vanilla pixel into the anti-aliased band where the ring
+        # blends into the wood (looser tolerance, so the gold ring itself
+        # stays) - otherwise a thin stepped strip of the old upscale remains.
+        edge = region.copy()
+        edge[1:, :] |= region[:-1, :]
+        edge[:-1, :] |= region[1:, :]
+        edge[:, 1:] |= region[:, :-1]
+        edge[:, :-1] |= region[:, 1:]
+        region |= edge & (diff <= BACKGROUND_MATTE_EDGE_TOLERANCE) & (piece_idx != 0)
+
+        piece_png = hd_out_dir(piece_rel) / "r0_f0.png"
+        bg_png = hd_out_dir(bg_rel) / "r0_f0.png"
+        # Outside the per-art work dir: cmd_unpack() wipes that every run.
+        backup = config.WORK_DIR / "_matte_originals" / f"{work_dir_for(piece_rel).name}.png"
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        if not backup.exists():
+            shutil.copyfile(piece_png, backup)
+
+        hd_piece = np.asarray(Image.open(backup).convert("RGBA"), dtype=np.float32)
+        hd_bg = np.asarray(Image.open(bg_png).convert("RGBA"), dtype=np.float32)
+        scale = hd_piece.shape[1] // pw
+        if hd_piece.shape[0] != ph * scale or hd_bg.shape[1] != bg_rgb.shape[1] * scale:
+            raise RuntimeError(f"{piece_rel}: unexpected HD sizes {hd_piece.shape} / {hd_bg.shape}")
+
+        crop = hd_bg[oy * scale:(oy + ph) * scale, ox * scale:(ox + pw) * scale]
+
+        # 4x nearest mask, then a small box feather so the seam at the ring
+        # isn't a hard step between the two upscales.
+        weight = np.kron(region.astype(np.float32), np.ones((scale, scale), dtype=np.float32))
+        for _ in range(BACKGROUND_MATTE_FEATHER):
+            padded = np.pad(weight, 1, mode="edge")
+            weight = np.minimum(weight, (padded[:-2, 1:-1] + padded[2:, 1:-1] + padded[1:-1, :-2] + padded[1:-1, 2:] + weight) / 5.0)
+        weight = weight[..., None]
+
+        out = hd_piece * (1.0 - weight) + crop * weight
+        out[..., 3] = np.maximum(hd_piece[..., 3], weight[..., 0] * 255.0)
+        Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8), "RGBA").save(piece_png)
+        print(f"{piece_rel}: {int(region.sum())} of {ph * pw} px taken from {bg_rel} at ({ox},{oy}) -> {piece_png}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1339,6 +1446,8 @@ def main() -> None:
 
     p_tile_selfwrap = sub.add_parser("hd-tile-selfwrap", help="Reprocess ground tiles with a 3x3 self-wrap composite (fixes independent-upscale seam risk); ALWAYS overwrites hd/art/tile/")
     p_tile_selfwrap.add_argument("--model", default=None, help="Force one ncnn model (default: config.REALESRGAN_MODEL)")
+
+    sub.add_parser("hd-background-matte", help="Replace the background baked into PC-lens-style pieces with the HD background crop (see BACKGROUND_MATTE_PIECES)")
 
     p_hd = sub.add_parser("hd", help="Emit 4x RGBA PNG sidecars under hd/art/ for one .ART (rel_path) or a whole art/ category")
     p_hd.add_argument("target", help="art/<cat>/Name.ART rel_path, or a category folder name (interface, item, ...)")
@@ -1383,6 +1492,10 @@ def main() -> None:
 
     if args.command == "hd-worldmap":
         cmd_hd_worldmap(force=args.force, model=args.model)
+        return
+
+    if args.command == "hd-background-matte":
+        cmd_hd_background_matte()
         return
 
     if args.command == "hd-tile-selfwrap":
