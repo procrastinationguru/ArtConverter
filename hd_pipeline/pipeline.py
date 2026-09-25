@@ -1309,6 +1309,74 @@ def load_file_list(list_path: Path) -> list[str]:
     return lines
 
 
+# Alpha edge smoothing (playtest round 4: "rings and circular buttons are far
+# from perfect circles"). hq4x straightens diagonals, but a curve in the
+# 1-bit colour-key mask is a staircase of 1-px steps, which comes out as
+# 4-px steps at HD. A small Gaussian blur at 4x (sigma well under one
+# source pixel) averages the steps into a slope, then a smoothstep
+# re-sharpens it to a ~2 px anti-aliased edge. Straight edges stay put;
+# square corners round by ~1 HD px, invisible at display scale.
+ALPHA_SMOOTH_SIGMA = 2.5
+ALPHA_SMOOTH_EDGE = (0.3, 0.7)
+
+
+def gaussian_blur_2d(img: np.ndarray, sigma: float) -> np.ndarray:
+    """Separable Gaussian blur, edge-padded, pure numpy (no scipy here)."""
+    radius = max(1, int(round(sigma * 3)))
+    xs = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel = np.exp(-(xs * xs) / (2.0 * sigma * sigma))
+    kernel /= kernel.sum()
+    padded = np.pad(img, ((0, 0), (radius, radius)), mode="edge")
+    out = np.zeros_like(img, dtype=np.float32)
+    for i, k in enumerate(kernel):
+        out += k * padded[:, i:i + img.shape[1]]
+    padded = np.pad(out, ((radius, radius), (0, 0)), mode="edge")
+    out2 = np.zeros_like(out)
+    for i, k in enumerate(kernel):
+        out2 += k * padded[i:i + img.shape[0], :]
+    return out2
+
+
+def smooth_alpha(alpha: np.ndarray) -> np.ndarray:
+    """0..1 float alpha -> de-staircased 0..1 float alpha."""
+    lo, hi = ALPHA_SMOOTH_EDGE
+    t = np.clip((gaussian_blur_2d(alpha.astype(np.float32), ALPHA_SMOOTH_SIGMA) - lo) / (hi - lo), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def cmd_hd_smooth_alpha(category: str = "interface") -> None:
+    """Apply smooth_alpha() to every existing hd/art/<category>/ sidecar
+    that has real transparency. Colour is untouched (no re-upscale). The
+    first run keeps the originals in work/_alpha_originals/ and every run
+    starts from them, so it is safe to rerun or retune."""
+    root = config.HD_OVERLAY_DIR / "art" / category
+    backup_root = config.WORK_DIR / "_alpha_originals" / category
+    # hd-background-matte smooths its own pieces (it regenerates them from
+    # their originals, so a smoothed copy here would go stale).
+    matte_dirs = {hd_out_dir(piece) for piece, _, _ in BACKGROUND_MATTE_PIECES}
+    done = skipped = 0
+    for png in sorted(root.rglob("r*_f*.png")):
+        if png.parent in matte_dirs:
+            skipped += 1
+            continue
+        backup = backup_root / png.relative_to(root)
+        source = backup if backup.exists() else png
+        with Image.open(source) as im:
+            rgba = np.asarray(im.convert("RGBA"))
+        alpha = rgba[..., 3]
+        if alpha.min() == 255 or alpha.max() == 0:
+            skipped += 1
+            continue
+        if not backup.exists():
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(png, backup)
+        out = rgba.copy()
+        out[..., 3] = np.clip(smooth_alpha(alpha / 255.0) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        Image.fromarray(out, "RGBA").save(png, "PNG", compress_level=6)
+        done += 1
+    print(f"hd-smooth-alpha {category}: smoothed {done}, skipped {skipped} (opaque/empty)")
+
+
 # Interface pieces whose vanilla art has a copy of the background they sit
 # on baked into their opaque corners (the PC-lens rings: square art, round
 # ring, wood outside it). Upscaled on their own, those corners come out as a
@@ -1324,10 +1392,6 @@ BACKGROUND_MATTE_PIECES = [
 # piece re-quantized the same wood to its own palette (measured <= 6).
 BACKGROUND_MATTE_TOLERANCE = 12
 BACKGROUND_MATTE_EDGE_TOLERANCE = 48
-
-# HD pixels over which the swapped-in background fades into the piece's own
-# upscale at the seam (4x space).
-BACKGROUND_MATTE_FEATHER = 3
 
 
 def vanilla_frame_rgb(rel_path: str) -> tuple[np.ndarray, np.ndarray]:
@@ -1402,16 +1466,15 @@ def cmd_hd_background_matte() -> None:
 
         crop = hd_bg[oy * scale:(oy + ph) * scale, ox * scale:(ox + pw) * scale]
 
-        # 4x nearest mask, then a small box feather so the seam at the ring
-        # isn't a hard step between the two upscales.
-        weight = np.kron(region.astype(np.float32), np.ones((scale, scale), dtype=np.float32))
-        for _ in range(BACKGROUND_MATTE_FEATHER):
-            padded = np.pad(weight, 1, mode="edge")
-            weight = np.minimum(weight, (padded[:-2, 1:-1] + padded[2:, 1:-1] + padded[1:-1, :-2] + padded[1:-1, 2:] + weight) / 5.0)
+        # 4x nearest mask, de-staircased like the alpha (smooth_alpha), so
+        # the seam around the ring is a smooth curve rather than 4-px steps
+        # and isn't a hard cut between the two upscales.
+        weight = smooth_alpha(np.kron(region.astype(np.float32), np.ones((scale, scale), dtype=np.float32)))
         weight = weight[..., None]
 
         out = hd_piece * (1.0 - weight) + crop * weight
-        out[..., 3] = np.maximum(hd_piece[..., 3], weight[..., 0] * 255.0)
+        piece_alpha = smooth_alpha(hd_piece[..., 3] / 255.0) * 255.0
+        out[..., 3] = np.maximum(piece_alpha, weight[..., 0] * 255.0)
         Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8), "RGBA").save(piece_png)
         print(f"{piece_rel}: {int(region.sum())} of {ph * pw} px taken from {bg_rel} at ({ox},{oy}) -> {piece_png}")
 
@@ -1446,6 +1509,9 @@ def main() -> None:
 
     p_tile_selfwrap = sub.add_parser("hd-tile-selfwrap", help="Reprocess ground tiles with a 3x3 self-wrap composite (fixes independent-upscale seam risk); ALWAYS overwrites hd/art/tile/")
     p_tile_selfwrap.add_argument("--model", default=None, help="Force one ncnn model (default: config.REALESRGAN_MODEL)")
+
+    p_smooth = sub.add_parser("hd-smooth-alpha", help="De-staircase the alpha edges of existing hd/art/<category>/ sidecars (rings, round buttons); originals kept in work/_alpha_originals/")
+    p_smooth.add_argument("category", nargs="?", default="interface")
 
     sub.add_parser("hd-background-matte", help="Replace the background baked into PC-lens-style pieces with the HD background crop (see BACKGROUND_MATTE_PIECES)")
 
@@ -1492,6 +1558,10 @@ def main() -> None:
 
     if args.command == "hd-worldmap":
         cmd_hd_worldmap(force=args.force, model=args.model)
+        return
+
+    if args.command == "hd-smooth-alpha":
+        cmd_hd_smooth_alpha(args.category)
         return
 
     if args.command == "hd-background-matte":
