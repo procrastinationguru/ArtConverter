@@ -1692,6 +1692,85 @@ def redo_hd_frames(rel: str, frames: list[tuple[int, int]] | None = None, model:
     print(f"  redid {n} frame(s) of {rel}", flush=True)
 
 
+# --- hd-palettes: sidecars for an art's extra palettes ---------------------
+#
+# Many item arts (robes, chain/leather/plate armour, some swords) carry 2-4
+# palettes; the art id selects one (tig_art_id_palette_get). The BMPs the
+# converter writes always use palette 0, so those items had no HD sidecar
+# for their other colours and the engine refused them (tig_art_hd_blit:
+# palette != 0 -> 1x; playtest round 5, robe icon). The .ini lists every
+# palette as 256 "RRGGBB00"-ish tokens, each byte's two hex digits written
+# low nibble first (checked against the BMP palette: 768/768 channels).
+# Sidecars go to r<rot>_f<frame>_p<N>.png next to palette 0's.
+
+def read_ini_palettes(ini_path: Path) -> list[np.ndarray]:
+    text = ini_path.read_text(errors="replace")
+    parts = re.split(r"^palette (\d+):\s*$", text, flags=re.M)
+    out = []
+    for i in range(1, len(parts) - 1, 2):
+        toks = parts[i + 1].split()[:256]
+        if len(toks) < 256:
+            break
+        out.append(np.array([[int(t[j:j + 2][::-1], 16) for j in (0, 2, 4)] for t in toks], dtype=np.uint8))
+    return out
+
+
+def cmd_hd_palettes(categories: list[str], model: str | None = None, force: bool = False) -> None:
+    esrgan_model = model or config.REALESRGAN_MODEL
+    root = config.WORK_DIR / "_palettes"
+    for category in categories:
+        if root.exists():
+            shutil.rmtree(root)
+        (root / "in").mkdir(parents=True)
+        staged = []
+        for rel in find_category_files(category):
+            out_dir = hd_out_dir(rel)
+            if not out_dir.is_dir():
+                continue
+            try:
+                wd = cmd_unpack(rel, quiet=True)
+                basename = Path(rel).name.rsplit(".", 1)[0]
+                palettes = read_ini_palettes(wd / (basename + ".ini"))
+                if len(palettes) < 2:
+                    continue
+                n, anim = read_ini_frame_count(wd / (basename + ".ini"))
+                frames = hd_frame_bmps(wd, basename, n, anim)
+            except Exception as e:
+                print(f"  hd-palettes: skipped {rel}: {e}", flush=True)
+                continue
+            for p in range(1, len(palettes)):
+                for rot, frame, bmp in frames:
+                    dest = out_dir / f"r{rot}_f{frame}_p{p}.png"
+                    if dest.exists() and not force:
+                        continue
+                    w, h = read_bmp_dims(bmp)
+                    h = abs(h)
+                    idx = np.asarray(read_bmp_indices(bmp), dtype=np.uint8).reshape(h, w)
+                    key = idx == 0
+                    if key.all():
+                        continue
+                    src = np.clip(inpaint_colorkey(palettes[p][idx], key), 0, 255).astype(np.uint8)
+                    name = f"{len(staged):06d}.png"
+                    Image.fromarray(dedither(src, key), "RGB").save(root / "in" / name)
+                    staged.append(dict(rel=rel, dest=dest, w=w, h=h, key=key, name=name))
+        print(f"hd-palettes {category}: {len(staged)} palette frame(s) to upscale", flush=True)
+        if not staged:
+            continue
+        run_esrgan_batch(root / "in", root / "out", esrgan_model)
+        for s in staged:
+            out = root / "out" / s["name"]
+            if roughness(Image.open(out)) > PIXEL_SOUP_ROUGHNESS_THRESHOLD:
+                out = root / "soup" / s["name"]
+                out.parent.mkdir(exist_ok=True)
+                run_realcugan(root / "in" / s["name"], out)
+            hd = load_and_validate(out, (s["w"] * HD_SCALE, s["h"] * HD_SCALE), "hd-palettes")
+            mask_rgb = Image.fromarray(np.where(s["key"], 0, 255).astype(np.uint8), "L").convert("RGB")
+            hd.putalpha(hqx.hq4x(mask_rgb).convert("L"))
+            write_sidecar(s["rel"], s["dest"], hd)
+        print(f"hd-palettes {category}: wrote {len(staged)} sidecar(s)", flush=True)
+    shutil.rmtree(root, ignore_errors=True)
+
+
 # --- hd-requeue: frames whose route changed under the one-model policy ----
 
 def _requeue_art(rel: str) -> tuple[str, list[tuple[int, int]], str | None]:
@@ -2142,6 +2221,11 @@ def main() -> None:
     p_requeue.add_argument("--dry-run", action="store_true")
     p_requeue.add_argument("--model", default=None)
 
+    p_pal = sub.add_parser("hd-palettes", help="Sidecars (r<rot>_f<frame>_p<N>.png) for arts' extra palettes 1-3")
+    p_pal.add_argument("categories", nargs="+")
+    p_pal.add_argument("--model", default=None)
+    p_pal.add_argument("--force", action="store_true")
+
     sub.add_parser("hd-background-matte", help="Replace the background baked into PC-lens-style pieces with the HD background crop (see BACKGROUND_MATTE_PIECES)")
 
     p_hd = sub.add_parser("hd", help="Emit 4x RGBA PNG sidecars under hd/art/ for one .ART (rel_path) or a whole art/ category")
@@ -2203,6 +2287,10 @@ def main() -> None:
 
     if args.command == "hd-requeue":
         cmd_hd_requeue(args.categories, workers=args.workers, dry_run=args.dry_run, model=args.model)
+        return
+
+    if args.command == "hd-palettes":
+        cmd_hd_palettes(args.categories, model=args.model, force=args.force)
         return
 
     if args.command == "hd-background-matte":
