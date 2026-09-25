@@ -183,7 +183,10 @@ def structural_corr(src: np.ndarray, out_small: np.ndarray, where: np.ndarray | 
     b = out_small.astype(np.float32) @ lum
     if where is not None:
         a, b = a[where], b[where]
-    if a.size < 4 or a.std() < 1.0:
+    # Too few pixels to judge: eye_candy has hundreds of 3x3-ish frames with
+    # a handful of opaque pixels whose (correct) upscales correlate at
+    # random, and each "failure" cost a single-file redo.
+    if a.size < 64 or a.std() < 1.0:
         return 1.0
     if b.std() < 1e-3:
         return 0.0
