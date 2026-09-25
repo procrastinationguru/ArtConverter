@@ -165,32 +165,50 @@ def run_realcugan(src_png: Path, dest_png: Path) -> None:
 # 8x40 frame in the x16 trial - not a clean size threshold, 5 and 12 px wide
 # were fine) every later output in the same batch is another buffer read at
 # the wrong stride, exit code 0, right size, not blank. Every batch output is
-# therefore checked against its own input (box-downscaled back to 1x, mean
-# abs diff): real upscales stay <= ~10, the garbage was >= 18. Failures are
-# redone single-file, which never showed the problem.
-BATCH_OUTPUT_MAX_DIFF = 14.0
+# therefore checked against its own input: box-downscaled back to 1x, the
+# luma correlation with the source was >= 0.94 for every real upscale and
+# <= 0.22 (or a flat image) for every garbage one. Mean abs diff doesn't
+# separate them - dithered chainmail or a gradient vial legitimately differ
+# by 15-24 once ESRGAN smooths the dither. Failures are redone single-file,
+# which never showed the problem.
+BATCH_OUTPUT_MIN_CORR = 0.5
 
 
-def batch_output_diff(src_png: Path, out_png: Path) -> float:
+def structural_corr(src: np.ndarray, out_small: np.ndarray, where: np.ndarray | None = None) -> float:
+    """Luma correlation of two same-size RGB arrays (optionally only where
+    `where`). A flat source can't be judged -> 1.0; a flat output of a
+    non-flat source -> 0.0."""
+    lum = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    a = src.astype(np.float32) @ lum
+    b = out_small.astype(np.float32) @ lum
+    if where is not None:
+        a, b = a[where], b[where]
+    if a.size < 4 or a.std() < 1.0:
+        return 1.0
+    if b.std() < 1e-3:
+        return 0.0
+    return float(np.corrcoef(a.ravel(), b.ravel())[0, 1])
+
+
+def batch_output_corr(src_png: Path, out_png: Path) -> float:
     src = Image.open(src_png).convert("RGB")
     out = Image.open(out_png).convert("RGB")
     if out.size != (src.width * HD_SCALE, src.height * HD_SCALE):
-        return float("inf")
-    small = np.asarray(out.resize(src.size, Image.BOX), dtype=np.float32)
-    return float(np.abs(small - np.asarray(src, dtype=np.float32)).mean())
+        return -1.0
+    return structural_corr(np.asarray(src), np.asarray(out.resize(src.size, Image.BOX)))
 
 
 def verify_batch(src_dir: Path, dest_dir: Path, redo) -> None:
     redone = 0
     for src in sorted(src_dir.glob("*.png")):
         out = dest_dir / src.name
-        if out.is_file() and batch_output_diff(src, out) <= BATCH_OUTPUT_MAX_DIFF:
+        if out.is_file() and batch_output_corr(src, out) >= BATCH_OUTPUT_MIN_CORR:
             continue
         redo(src, out)
         redone += 1
-        diff = batch_output_diff(src, out) if out.is_file() else float("inf")
-        if diff > BATCH_OUTPUT_MAX_DIFF:
-            print(f"  warning: {out.name} still differs from its source after a single-file redo ({diff:.1f})")
+        corr = batch_output_corr(src, out) if out.is_file() else -1.0
+        if corr < BATCH_OUTPUT_MIN_CORR:
+            print(f"  warning: {out.name} still doesn't match its source after a single-file redo (corr {corr:.2f})")
     if redone:
         print(f"  {redone} corrupt batch output(s) in {dest_dir.name} redone single-file")
 
@@ -581,9 +599,14 @@ def cmd_hd_movies(force: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 HD_SCALE = 4
-# Frames below this area always route to Real-CUGAN instead of ESRGAN (see
-# cmd_hd) - too little spatial context for the photo/8k ESRGAN model on tiny
-# icons.
+# Frames below this area used to route to Real-CUGAN (assumed too little
+# context for ESRGAN). cmd_hd no longer does: the "pixel soup" behind that
+# rule was the ncnn directory-mode corruption (see verify_batch), and
+# single-file ESRGAN matched or beat CUGAN on 60 small interface frames
+# (comparison/small_frames/) - CUGAN kept dither as a mesh. One model for
+# everything; CUGAN is left for FORCE_CUGAN_ASSETS and the soup fallback.
+# Still used by the tile self-wrap route (whose composites are never small)
+# and to find the frames that took the old route (hd-requeue).
 HD_SMALL_FRAME_PX = 48
 
 
@@ -672,6 +695,85 @@ def inpaint_colorkey(rgb: np.ndarray, key: np.ndarray, max_iter: int = 64) -> np
 # rare, manually-fixable issue (redo that one .ART individually) instead.
 
 
+# Selective de-dither. ESRGAN (Nomos8kSC) reads a strict 1-px checkerboard
+# dither as heavy noise and paints the whole frame over with a washed-out
+# blur (NextBut's hover/pressed arrow: the entire button came out a pale
+# smear); Real-CUGAN keeps it as a visible mesh (cncl_big's X). A light blur
+# of just the dithered area first gives the solid gradient the dither was
+# standing in for. Detection is deliberately strict - a pixel counts only if
+# its 4 neighbours agree with each other, its diagonals agree with it, and
+# the two differ - so noisy texture that merely looks dithered (chainmail,
+# fur, bark) is left alone; only areas where such pixels are the majority
+# get blurred (comparison/dedither/).
+DEDITHER_SIGMA = 0.7
+DEDITHER_SHARE = (0.3, 0.55)
+
+
+def dither_weight(rgb: np.ndarray, key: np.ndarray) -> np.ndarray:
+    """0..1 per pixel: how much of the neighbourhood is strict checkerboard."""
+    lum = rgb.astype(np.float32) @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    p = np.pad(lum, 1, mode="edge")
+    n = np.stack([p[:-2, 1:-1], p[2:, 1:-1], p[1:-1, :-2], p[1:-1, 2:]])
+    d = np.stack([p[:-2, :-2], p[:-2, 2:], p[2:, :-2], p[2:, 2:]])
+    contrast = np.abs(lum - n.mean(0))
+    checker = (
+        (contrast > 6.0)
+        & (n.max(0) - n.min(0) < 0.5 * contrast)
+        & (d.max(0) - d.min(0) < 0.5 * contrast)
+        & (np.abs(lum - d.mean(0)) < 0.35 * contrast)
+        & ~key
+    )
+    lo, hi = DEDITHER_SHARE
+    share = gaussian_blur_2d(checker.astype(np.float32), 1.5)
+    return np.clip((share - lo) / (hi - lo), 0.0, 1.0)
+
+
+def dedither(rgb: np.ndarray, key: np.ndarray) -> np.ndarray:
+    """uint8 RGB -> uint8 RGB with only its checkerboard-dithered areas blurred."""
+    w = dither_weight(rgb, key)
+    if w.max() == 0.0:
+        return rgb
+    w = w[..., None]
+    blur = np.stack([gaussian_blur_2d(rgb[..., c].astype(np.float32), DEDITHER_SIGMA) for c in range(3)], axis=2)
+    return np.clip(rgb * (1.0 - w) + blur * w + 0.5, 0, 255).astype(np.uint8)
+
+
+# Categories whose sidecars get smooth_alpha() (the AA pass) as they are
+# written. Not wall/roof/facade/tile: those pieces butt against each other,
+# and a softened edge on both sides of a joint would show as a seam.
+ALPHA_SMOOTH_CATEGORIES = {
+    "interface", "item", "critter", "monster", "unique_npc", "scenery",
+    "eye_candy", "container", "portal", "light",
+}
+
+
+def alpha_backup_path(dest: Path) -> Path:
+    rel = dest.relative_to(config.HD_OVERLAY_DIR / "art")
+    return config.WORK_DIR / "_alpha_originals" / rel
+
+
+def write_sidecar(rel_path: str, dest: Path, rgba: Image.Image) -> None:
+    """Save one frame's raw RGBA sidecar, applying the AA pass (smooth_alpha)
+    where its category takes it. The raw frame then goes to
+    work/_alpha_originals/ (what hd-smooth-alpha reruns start from); any
+    stale backup of a frame that isn't smoothed is dropped."""
+    category = Path(rel_path.replace("\\", "/")).parts[1]
+    arr = np.asarray(rgba.convert("RGBA"))
+    alpha = arr[..., 3]
+    matte = dest.parent in {hd_out_dir(piece) for piece, _, _ in BACKGROUND_MATTE_PIECES}
+    backup = alpha_backup_path(dest)
+    if category in ALPHA_SMOOTH_CATEGORIES and not matte and alpha.min() < 255 and alpha.max() > 0:
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(arr, "RGBA").save(backup, "PNG", compress_level=6)
+        out = arr.copy()
+        out[..., 3] = np.clip(smooth_alpha(alpha / 255.0) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        Image.fromarray(out, "RGBA").save(dest, "PNG", compress_level=6)
+    else:
+        if backup.exists():
+            backup.unlink()
+        Image.fromarray(arr, "RGBA").save(dest, "PNG", compress_level=6)
+
+
 def render_bar(current: int, total: int, width: int = 16) -> str:
     filled = width if not total else min(width, round(width * current / total))
     return "[" + "#" * filled + "-" * (width - filled) + "]"
@@ -704,8 +806,8 @@ def cmd_hd(rel_path: str, model: str | None = None, force: bool = False, quiet: 
     # calling out to ncnn-vulkan per frame - see run_esrgan_batch/
     # run_realcugan_batch for why (one directory-mode launch per group
     # instead of one launch per frame, ~15x fewer subprocess/model-load
-    # round trips). is_small/force_cugan routing unchanged from before, just
-    # deferred until both groups' single batch calls run.
+    # round trips). Everything goes to ESRGAN (de-dithered first) except
+    # FORCE_CUGAN_ASSETS; see HD_SMALL_FRAME_PX and dedither().
     esrgan_in, esrgan_out = wd / "_esrgan_in", wd / "_esrgan_out"
     cugan_in, cugan_out = wd / "_cugan_in", wd / "_cugan_out"
     esrgan_in.mkdir(exist_ok=True)
@@ -721,8 +823,9 @@ def cmd_hd(rel_path: str, model: str | None = None, force: bool = False, quiet: 
         rgb = palette[indices]
 
         src_rgb = np.clip(inpaint_colorkey(rgb, key), 0, 255).astype(np.uint8)
-        is_small = w * h < HD_SMALL_FRAME_PX * HD_SMALL_FRAME_PX
-        route = "cugan" if (force_cugan or is_small) else "esrgan"
+        route = "cugan" if force_cugan else "esrgan"
+        if route == "esrgan":
+            src_rgb = dedither(src_rgb, key)
         key_name = f"{rot}_{frame}.png"
         staging_dir = cugan_in if route == "cugan" else esrgan_in
         src_png = staging_dir / key_name
@@ -808,7 +911,7 @@ def cmd_hd(rel_path: str, model: str | None = None, force: bool = False, quiet: 
         rgba = hd.copy()
         rgba.putalpha(alpha)
         dest = out_dir / f"r{rot}_f{frame}.png"
-        rgba.save(dest, "PNG", optimize=True)
+        write_sidecar(rel_path, dest, rgba)
         if not quiet:
             model_label = "realcugan" if (route == "cugan" or pixel_soup_fallback) else esrgan_model
             print(f"  {bmp.name} -> {dest.relative_to(config.HD_OVERLAY_DIR)} ({rgba.size[0]}x{rgba.size[1]}, {model_label})")
@@ -1384,37 +1487,266 @@ def smooth_alpha(alpha: np.ndarray) -> np.ndarray:
     return t * t * (3.0 - 2.0 * t)
 
 
-def cmd_hd_smooth_alpha(category: str = "interface") -> None:
+def _smooth_alpha_file(png: Path) -> bool:
+    backup = alpha_backup_path(png)
+    source = backup if backup.exists() else png
+    with Image.open(source) as im:
+        rgba = np.asarray(im.convert("RGBA"))
+    alpha = rgba[..., 3]
+    if alpha.min() == 255 or alpha.max() == 0:
+        return False
+    if not backup.exists():
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(png, backup)
+    out = rgba.copy()
+    out[..., 3] = np.clip(smooth_alpha(alpha / 255.0) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    Image.fromarray(out, "RGBA").save(png, "PNG", compress_level=6)
+    return True
+
+
+def cmd_hd_smooth_alpha(category: str = "interface", workers: int = 8) -> None:
     """Apply smooth_alpha() to every existing hd/art/<category>/ sidecar
     that has real transparency. Colour is untouched (no re-upscale). The
     first run keeps the originals in work/_alpha_originals/ and every run
-    starts from them, so it is safe to rerun or retune."""
+    starts from them, so it is safe to rerun or retune. New sidecars get
+    this as they're written (write_sidecar, ALPHA_SMOOTH_CATEGORIES)."""
+    from concurrent.futures import ProcessPoolExecutor
     root = config.HD_OVERLAY_DIR / "art" / category
-    backup_root = config.WORK_DIR / "_alpha_originals" / category
     # hd-background-matte smooths its own pieces (it regenerates them from
     # their originals, so a smoothed copy here would go stale).
     matte_dirs = {hd_out_dir(piece) for piece, _, _ in BACKGROUND_MATTE_PIECES}
-    done = skipped = 0
-    for png in sorted(root.rglob("r*_f*.png")):
-        if png.parent in matte_dirs:
-            skipped += 1
+    pngs = [p for p in sorted(root.rglob("r*_f*.png")) if p.parent not in matte_dirs]
+    done = 0
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for i, smoothed in enumerate(pool.map(_smooth_alpha_file, pngs, chunksize=64), 1):
+            done += smoothed
+            if i % 5000 == 0:
+                print(f"  {render_bar(i, len(pngs))} {i}/{len(pngs)}", flush=True)
+    print(f"hd-smooth-alpha {category}: smoothed {done}, skipped {len(pngs) - done} (opaque/empty)", flush=True)
+
+
+# --- hd-scan: find sidecars written from corrupt ncnn batch output ---------
+#
+# Everything generated before verify_batch() existed went through ncnn
+# directory mode unchecked (see BATCH_OUTPUT_MIN_CORR). A frame is flagged
+# when its sidecar, box-downscaled to 1x, correlates with the vanilla frame
+# below that same threshold over the vanilla frame's opaque pixels (key
+# pixels are inpainted before upscaling, so they're no reference). --fix
+# redoes just those frames single-file, through the same route cmd_hd takes.
+
+def _scan_art(rel: str) -> tuple[str, int, list[tuple[int, int, float]], str | None]:
+    """(rel, frames checked, [(rot, frame, corr) below threshold], error)."""
+    import tempfile
+    out_dir = hd_out_dir(rel)
+    bad: list[tuple[int, int, float]] = []
+    checked = 0
+    try:
+        with tempfile.TemporaryDirectory(dir=config.WORK_DIR / "_scan_tmp") as tmp:
+            basename = Path(rel).name.rsplit(".", 1)[0]
+            run_art_converter(find_source_art(rel), Path(tmp) / basename)
+            n, anim = read_ini_frame_count(Path(tmp) / (basename + ".ini"))
+            for rot, frame, bmp in hd_frame_bmps(Path(tmp), basename, n, anim):
+                png = out_dir / f"r{rot}_f{frame}.png"
+                if not png.is_file():
+                    continue
+                w, h = read_bmp_dims(bmp)
+                h = abs(h)
+                idx = np.asarray(read_bmp_indices(bmp), dtype=np.uint8).reshape(h, w)
+                opaque = idx != 0
+                if not opaque.any():
+                    continue
+                checked += 1
+                pal = np.asarray(read_bmp_palette(bmp), dtype=np.uint8).reshape(256, 3)
+                with Image.open(png) as im:
+                    hd = im.convert("RGB")
+                if hd.size != (w * HD_SCALE, h * HD_SCALE):
+                    bad.append((rot, frame, float("inf")))
+                    continue
+                corr = structural_corr(pal[idx], np.asarray(hd.resize((w, h), Image.BOX)), opaque)
+                if corr < BATCH_OUTPUT_MIN_CORR:
+                    bad.append((rot, frame, corr))
+    except Exception as e:  # report and keep scanning
+        return rel, checked, bad, str(e)
+    return rel, checked, bad, None
+
+
+def _hd_art_rel_paths(category: str) -> list[str]:
+    """Source rel_paths of the .ARTs that have a sidecar dir under hd/art/<category>/."""
+    return [rel for rel in find_category_files(category) if hd_out_dir(rel).is_dir()]
+
+
+def cmd_hd_scan(categories: list[str], workers: int = 8, fix: bool = False, model: str | None = None) -> None:
+    (config.WORK_DIR / "_scan_tmp").mkdir(parents=True, exist_ok=True)
+    report = batch_log_dir() / "hd_scan.txt"
+    for category in categories:
+        rels = _hd_art_rel_paths(category)
+        print(f"hd-scan {category}: {len(rels)} art(s), {workers} worker(s)...", flush=True)
+        from concurrent.futures import ProcessPoolExecutor
+        checked = 0
+        bad_by_art: dict[str, list[tuple[int, int, float]]] = {}
+        with ProcessPoolExecutor(max_workers=workers) as pool, open(report, "a", encoding="utf-8") as log:
+            for i, (rel, n, bad, err) in enumerate(pool.map(_scan_art, rels, chunksize=4), 1):
+                checked += n
+                if err:
+                    log.write(f"ERROR|{rel}|{err.splitlines()[0] if err else ''}\n")
+                for rot, frame, corr in bad:
+                    log.write(f"BAD|{rel}|r{rot}_f{frame}|corr {corr:.2f}\n")
+                if bad:
+                    bad_by_art[rel] = bad
+                if i % 200 == 0 or i == len(rels):
+                    nbad = sum(len(b) for b in bad_by_art.values())
+                    print(f"  {render_bar(i, len(rels))} {i}/{len(rels)} arts, {checked} frames, {nbad} bad", flush=True)
+        nbad = sum(len(b) for b in bad_by_art.values())
+        print(f"hd-scan {category}: {nbad} bad frame(s) in {len(bad_by_art)} art(s) (list in {report})", flush=True)
+        if fix and bad_by_art:
+            n = regenerate_frames([(rel, [(r, f) for r, f, _ in bad]) for rel, bad in bad_by_art.items()], model=model)
+            print(f"hd-scan {category}: redid {n} frame(s)", flush=True)
+
+
+REGEN_CHUNK_FRAMES = 1500
+
+
+def regenerate_frames(jobs: list[tuple[str, list[tuple[int, int]] | None]], model: str | None = None) -> int:
+    """Regenerate frames exactly as cmd_hd now would (ESRGAN after
+    dedither(), FORCE_CUGAN_ASSETS through Real-CUGAN, soup fallback,
+    hq4x alpha, write_sidecar's AA pass), for [(rel, [(rot, frame)] or None
+    for all)], many arts per verified directory-mode launch. Returns the
+    number of frames written."""
+    esrgan_model = model or config.REALESRGAN_MODEL
+    root = config.WORK_DIR / "_regen"
+    written = 0
+
+    def flush(staged: list[dict]) -> int:
+        if not staged:
+            return 0
+        e_in, c_in = root / "e_in", root / "c_in"
+        if any(s["route"] == "esrgan" for s in staged):
+            run_esrgan_batch(e_in, root / "e_out", esrgan_model)
+        if any(s["route"] == "cugan" for s in staged):
+            run_realcugan_batch(c_in, root / "c_out")
+        for s in staged:
+            name = s["name"]
+            if s["route"] == "cugan":
+                out = root / "c_out" / name
+            else:
+                out = root / "e_out" / name
+                if roughness(Image.open(out)) > PIXEL_SOUP_ROUGHNESS_THRESHOLD:
+                    out = root / "soup" / name
+                    out.parent.mkdir(exist_ok=True)
+                    run_realcugan(e_in / name, out)
+            hd = load_and_validate(out, (s["w"] * HD_SCALE, s["h"] * HD_SCALE), "regenerate")
+            mask_rgb = Image.fromarray(np.where(s["key"], 0, 255).astype(np.uint8), "L").convert("RGB")
+            hd.putalpha(hqx.hq4x(mask_rgb).convert("L"))
+            write_sidecar(s["rel"], s["dest"], hd)
+        return len(staged)
+
+    def reset() -> None:
+        if root.exists():
+            shutil.rmtree(root)
+        for d in ("e_in", "c_in", "art"):
+            (root / d).mkdir(parents=True)
+
+    reset()
+    staged: list[dict] = []
+    for ai, (rel, frames) in enumerate(jobs):
+        try:
+            art_dir = root / "art" / f"{ai:06d}"
+            art_dir.mkdir()
+            basename = Path(rel.replace("\\", "/")).name.rsplit(".", 1)[0]
+            run_art_converter(find_source_art(rel), art_dir / basename)
+            n, anim = read_ini_frame_count(art_dir / (basename + ".ini"))
+            by_key = {(r, f): p for r, f, p in hd_frame_bmps(art_dir, basename, n, anim)}
+        except Exception as e:
+            print(f"  regenerate: skipped {rel}: {e}", flush=True)
             continue
-        backup = backup_root / png.relative_to(root)
-        source = backup if backup.exists() else png
-        with Image.open(source) as im:
-            rgba = np.asarray(im.convert("RGBA"))
-        alpha = rgba[..., 3]
-        if alpha.min() == 255 or alpha.max() == 0:
-            skipped += 1
-            continue
-        if not backup.exists():
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(png, backup)
-        out = rgba.copy()
-        out[..., 3] = np.clip(smooth_alpha(alpha / 255.0) * 255.0 + 0.5, 0, 255).astype(np.uint8)
-        Image.fromarray(out, "RGBA").save(png, "PNG", compress_level=6)
-        done += 1
-    print(f"hd-smooth-alpha {category}: smoothed {done}, skipped {skipped} (opaque/empty)")
+        force_cugan = rel.replace("\\", "/") in config.FORCE_CUGAN_ASSETS
+        out_dir = hd_out_dir(rel)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for rot, frame in frames if frames is not None else list(by_key):
+            bmp = by_key[(rot, frame)]
+            w, h = read_bmp_dims(bmp)
+            h = abs(h)
+            idx = np.asarray(read_bmp_indices(bmp), dtype=np.uint8).reshape(h, w)
+            pal = np.asarray(read_bmp_palette(bmp), dtype=np.uint8).reshape(256, 3)
+            key = idx == 0
+            src = np.clip(inpaint_colorkey(pal[idx], key), 0, 255).astype(np.uint8)
+            route = "cugan" if force_cugan else "esrgan"
+            if route == "esrgan":
+                src = dedither(src, key)
+            name = f"{len(staged):06d}.png"
+            Image.fromarray(src, "RGB").save(root / ("c_in" if route == "cugan" else "e_in") / name)
+            staged.append(dict(rel=rel, dest=out_dir / f"r{rot}_f{frame}.png", w=w, h=h, key=key, route=route, name=name))
+        if len(staged) >= REGEN_CHUNK_FRAMES:
+            written += flush(staged)
+            print(f"  regenerate: {written} frame(s) written, {ai + 1}/{len(jobs)} art(s)", flush=True)
+            staged = []
+            reset()
+    written += flush(staged)
+    shutil.rmtree(root, ignore_errors=True)
+    return written
+
+
+def redo_hd_frames(rel: str, frames: list[tuple[int, int]] | None = None, model: str | None = None) -> None:
+    """Regenerate some (default: all) frames of one .ART - see regenerate_frames."""
+    n = regenerate_frames([(rel, frames)], model=model)
+    print(f"  redid {n} frame(s) of {rel}", flush=True)
+
+
+# --- hd-requeue: frames whose route changed under the one-model policy ----
+
+def _requeue_art(rel: str) -> tuple[str, list[tuple[int, int]], str | None]:
+    """Frames of one .ART that cmd_hd would now upscale differently: those
+    the old size rule sent to Real-CUGAN, and those dedither() changes."""
+    import tempfile
+    out_dir = hd_out_dir(rel)
+    todo: list[tuple[int, int]] = []
+    if rel.replace("\\", "/") in config.FORCE_CUGAN_ASSETS:
+        return rel, todo, None
+    try:
+        with tempfile.TemporaryDirectory(dir=config.WORK_DIR / "_scan_tmp") as tmp:
+            basename = Path(rel).name.rsplit(".", 1)[0]
+            run_art_converter(find_source_art(rel), Path(tmp) / basename)
+            n, anim = read_ini_frame_count(Path(tmp) / (basename + ".ini"))
+            for rot, frame, bmp in hd_frame_bmps(Path(tmp), basename, n, anim):
+                if not (out_dir / f"r{rot}_f{frame}.png").is_file():
+                    continue
+                w, h = read_bmp_dims(bmp)
+                h = abs(h)
+                idx = np.asarray(read_bmp_indices(bmp), dtype=np.uint8).reshape(h, w)
+                key = idx == 0
+                if key.all():
+                    continue
+                if w * h < HD_SMALL_FRAME_PX * HD_SMALL_FRAME_PX:
+                    todo.append((rot, frame))
+                    continue
+                pal = np.asarray(read_bmp_palette(bmp), dtype=np.uint8).reshape(256, 3)
+                if dither_weight(pal[idx], key).max() > 0.0:
+                    todo.append((rot, frame))
+    except Exception as e:
+        return rel, todo, str(e)
+    return rel, todo, None
+
+
+def cmd_hd_requeue(categories: list[str], workers: int = 8, dry_run: bool = False, model: str | None = None) -> None:
+    from concurrent.futures import ProcessPoolExecutor
+    (config.WORK_DIR / "_scan_tmp").mkdir(parents=True, exist_ok=True)
+    for category in categories:
+        rels = _hd_art_rel_paths(category)
+        jobs: list[tuple[str, list[tuple[int, int]]]] = []
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            for rel, todo, err in pool.map(_requeue_art, rels, chunksize=4):
+                if err:
+                    print(f"  requeue: {rel}: {err.splitlines()[0]}", flush=True)
+                if todo:
+                    jobs.append((rel, todo))
+        nframes = sum(len(t) for _, t in jobs)
+        print(f"hd-requeue {category}: {nframes} frame(s) in {len(jobs)} art(s) take the new route", flush=True)
+        with open(batch_log_dir() / f"hd_requeue_{category}.txt", "w", encoding="utf-8") as f:
+            for rel, todo in jobs:
+                f.write(f"{rel}|{' '.join(f'r{r}_f{fr}' for r, fr in todo)}\n")
+        if not dry_run and jobs:
+            n = regenerate_frames(jobs, model=model)
+            print(f"hd-requeue {category}: regenerated {n} frame(s)", flush=True)
 
 
 # Interface pieces whose vanilla art has a copy of the background they sit
@@ -1749,6 +2081,12 @@ def cmd_hd_compose(only: str | None = None, model: str | None = None, dry_run: b
             backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(dest, backup)
         Image.fromarray(np.ascontiguousarray(rgba), "RGBA").save(dest)
+        # Its alpha is already smooth (the upscaled mask); a stale
+        # hd-smooth-alpha backup would otherwise bring the old frame back
+        # on that command's next run.
+        alpha_backup = alpha_backup_path(dest)
+        if alpha_backup.exists():
+            alpha_backup.unlink()
     print(f"hd-compose: wrote {len(jobs)} sidecar(s), skipped {skipped}; originals in {backup_root}")
 
 
@@ -1785,11 +2123,24 @@ def main() -> None:
 
     p_smooth = sub.add_parser("hd-smooth-alpha", help="De-staircase the alpha edges of existing hd/art/<category>/ sidecars (rings, round buttons); originals kept in work/_alpha_originals/")
     p_smooth.add_argument("category", nargs="?", default="interface")
+    p_smooth.add_argument("--workers", type=int, default=8)
 
     p_compose = sub.add_parser("hd-compose", help="Rebuild captured interface sidecars by compose -> upscale -> decompose over their real underlays (game's hd_capture/, see arcanum-ce tig_window_hd_capture)")
     p_compose.add_argument("--only", default=None, help="Only arts whose path contains this text")
     p_compose.add_argument("--model", default=None, help="Force one ncnn model (default: config.REALESRGAN_MODEL)")
     p_compose.add_argument("--dry-run", action="store_true", help="Only report which captured frames are usable")
+
+    p_scan = sub.add_parser("hd-scan", help="Find (and with --fix redo) hd/art sidecars written from corrupt ncnn batch output")
+    p_scan.add_argument("categories", nargs="+")
+    p_scan.add_argument("--workers", type=int, default=8)
+    p_scan.add_argument("--fix", action="store_true")
+    p_scan.add_argument("--model", default=None)
+
+    p_requeue = sub.add_parser("hd-requeue", help="Regenerate the frames the one-model policy upscales differently (old small-frame CUGAN route, checkerboard dither)")
+    p_requeue.add_argument("categories", nargs="+")
+    p_requeue.add_argument("--workers", type=int, default=8)
+    p_requeue.add_argument("--dry-run", action="store_true")
+    p_requeue.add_argument("--model", default=None)
 
     sub.add_parser("hd-background-matte", help="Replace the background baked into PC-lens-style pieces with the HD background crop (see BACKGROUND_MATTE_PIECES)")
 
@@ -1839,11 +2190,19 @@ def main() -> None:
         return
 
     if args.command == "hd-smooth-alpha":
-        cmd_hd_smooth_alpha(args.category)
+        cmd_hd_smooth_alpha(args.category, workers=args.workers)
         return
 
     if args.command == "hd-compose":
         cmd_hd_compose(only=args.only, model=args.model, dry_run=args.dry_run)
+        return
+
+    if args.command == "hd-scan":
+        cmd_hd_scan(args.categories, workers=args.workers, fix=args.fix, model=args.model)
+        return
+
+    if args.command == "hd-requeue":
+        cmd_hd_requeue(args.categories, workers=args.workers, dry_run=args.dry_run, model=args.model)
         return
 
     if args.command == "hd-background-matte":
