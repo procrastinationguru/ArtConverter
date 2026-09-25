@@ -1808,6 +1808,61 @@ def cmd_hd_palettes(categories: list[str], model: str | None = None, force: bool
     shutil.rmtree(root, ignore_errors=True)
 
 
+# --- hd-scroll-thumb: the scrollbar thumb, upscaled as one stack ----------
+#
+# scrollbar_ui.c draws the thumb as ScrllSlideT (11x5), then ScrllSlideM1
+# (11x1) once per pixel row, then ScrllSlideB (11x7), edge to edge. Upscaled
+# one by one, every 1-px row became its own 4-px ESRGAN strip, so the thumb
+# showed a seam per row (playtest round 2 item 8). Here the stack T + M1 x N
+# + B is upscaled as one image and cut back apart; the M1 sidecar is a row
+# from the middle (M1 above and below it, as when drawn), and the AA pass is
+# applied to the whole stack before slicing so no joint gets a softened edge.
+SCROLL_THUMB_PIECES = ("art/interface/ScrllSlideT.ART", "art/interface/ScrllSlideM1.ART", "art/interface/ScrllSlideB.ART")
+SCROLL_THUMB_REPEAT = 24
+
+
+def _frame_rgb_key(rel: str) -> tuple[np.ndarray, np.ndarray]:
+    wd = cmd_unpack(rel, quiet=True)
+    basename = Path(rel).name.rsplit(".", 1)[0]
+    n, anim = read_ini_frame_count(wd / (basename + ".ini"))
+    _, _, bmp = hd_frame_bmps(wd, basename, n, anim)[0]
+    w, h = read_bmp_dims(bmp)
+    h = abs(h)
+    idx = np.asarray(read_bmp_indices(bmp), dtype=np.uint8).reshape(h, w)
+    pal = np.asarray(read_bmp_palette(bmp), dtype=np.uint8).reshape(256, 3)
+    return pal[idx], idx == 0
+
+
+def cmd_hd_scroll_thumb(model: str | None = None) -> None:
+    rels = [next(r for r in find_category_files("interface") if r.lower() == p.lower()) for p in SCROLL_THUMB_PIECES]
+    (top, top_key), (mid, mid_key), (bot, bot_key) = (_frame_rgb_key(r) for r in rels)
+    rgb = np.concatenate([top] + [mid] * SCROLL_THUMB_REPEAT + [bot])
+    key = np.concatenate([top_key] + [mid_key] * SCROLL_THUMB_REPEAT + [bot_key])
+    src = dedither(np.clip(inpaint_colorkey(rgb, key), 0, 255).astype(np.uint8), key)
+    stage = config.WORK_DIR / "_scroll_thumb"
+    stage.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(src, "RGB").save(stage / "in.png")
+    run_esrgan(stage / "in.png", stage / "out.png", model or config.REALESRGAN_MODEL)
+    hd = np.asarray(load_and_validate(stage / "out.png", (src.shape[1] * HD_SCALE, src.shape[0] * HD_SCALE), "hd-scroll-thumb"))
+    mask_rgb = Image.fromarray(np.where(key, 0, 255).astype(np.uint8), "L").convert("RGB")
+    alpha = np.asarray(hqx.hq4x(mask_rgb).convert("L"), dtype=np.float32) / 255.0
+    if alpha.min() < 1.0:
+        alpha = smooth_alpha(alpha)
+    rgba = np.dstack([hd, np.clip(alpha * 255.0 + 0.5, 0, 255).astype(np.uint8)])
+    s = HD_SCALE
+    t_h, m_h = top.shape[0] * s, mid.shape[0] * s
+    mid_row = t_h + (SCROLL_THUMB_REPEAT // 2) * m_h
+    slices = [rgba[:t_h], rgba[mid_row:mid_row + m_h], rgba[-bot.shape[0] * s:]]
+    for rel, piece in zip(rels, slices):
+        dest = hd_out_dir(rel) / "r0_f0.png"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(np.ascontiguousarray(piece), "RGBA").save(dest, "PNG", compress_level=6)
+        backup = alpha_backup_path(dest)
+        if backup.exists():
+            backup.unlink()
+        print(f"hd-scroll-thumb: wrote {dest.relative_to(config.HD_OVERLAY_DIR)} ({piece.shape[1]}x{piece.shape[0]})")
+
+
 # --- hd-requeue: frames whose route changed under the one-model policy ----
 
 def _requeue_art(rel: str) -> tuple[str, list[tuple[int, int]], str | None]:
@@ -1817,6 +1872,10 @@ def _requeue_art(rel: str) -> tuple[str, list[tuple[int, int]], str | None]:
     out_dir = hd_out_dir(rel)
     todo: list[tuple[int, int]] = []
     if rel.replace("\\", "/") in config.FORCE_CUGAN_ASSETS:
+        return rel, todo, None
+    # Built as one stack by hd-scroll-thumb; a standalone redo would bring
+    # the seams back.
+    if rel.replace("\\", "/").lower() in {p.lower() for p in SCROLL_THUMB_PIECES}:
         return rel, todo, None
     try:
         with tempfile.TemporaryDirectory(dir=config.WORK_DIR / "_scan_tmp") as tmp:
@@ -2059,6 +2118,7 @@ def cmd_hd_compose(only: str | None = None, model: str | None = None, dry_run: b
     placements = read_capture_manifest()
     esrgan_model = model or config.REALESRGAN_MODEL
     matte_pieces = {piece.replace("\\", "/").lower() for piece, _, _ in BACKGROUND_MATTE_PIECES}
+    matte_pieces |= {p.lower() for p in SCROLL_THUMB_PIECES}  # built as one stack, hd-scroll-thumb
     stage = config.WORK_DIR / "_compose"
     if stage.exists():
         shutil.rmtree(stage)
@@ -2263,6 +2323,8 @@ def main() -> None:
     p_pal.add_argument("--model", default=None)
     p_pal.add_argument("--force", action="store_true")
 
+    sub.add_parser("hd-scroll-thumb", help="Upscale the scrollbar thumb (ScrllSlideT/M1/B) as one stack and cut it back apart (no per-row seams)")
+
     sub.add_parser("hd-background-matte", help="Replace the background baked into PC-lens-style pieces with the HD background crop (see BACKGROUND_MATTE_PIECES)")
 
     p_hd = sub.add_parser("hd", help="Emit 4x RGBA PNG sidecars under hd/art/ for one .ART (rel_path) or a whole art/ category")
@@ -2328,6 +2390,10 @@ def main() -> None:
 
     if args.command == "hd-palettes":
         cmd_hd_palettes(args.categories, model=args.model, force=args.force)
+        return
+
+    if args.command == "hd-scroll-thumb":
+        cmd_hd_scroll_thumb()
         return
 
     if args.command == "hd-background-matte":
