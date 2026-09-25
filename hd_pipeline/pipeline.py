@@ -160,23 +160,63 @@ def run_realcugan(src_png: Path, dest_png: Path) -> None:
 # Confirmed on GPU telemetry too: the original all-single-launch batch sat
 # at ~20% GPU utilization / ~45W the whole run (of a ~285W card) - compute
 # was never the bottleneck, subprocess/model-load churn was.
+#
+# Directory mode is not safe to trust, though: after some inputs (a 6x90 or
+# 8x40 frame in the x16 trial - not a clean size threshold, 5 and 12 px wide
+# were fine) every later output in the same batch is another buffer read at
+# the wrong stride, exit code 0, right size, not blank. Every batch output is
+# therefore checked against its own input (box-downscaled back to 1x, mean
+# abs diff): real upscales stay <= ~10, the garbage was >= 18. Failures are
+# redone single-file, which never showed the problem.
+BATCH_OUTPUT_MAX_DIFF = 14.0
+
+
+def batch_output_diff(src_png: Path, out_png: Path) -> float:
+    src = Image.open(src_png).convert("RGB")
+    out = Image.open(out_png).convert("RGB")
+    if out.size != (src.width * HD_SCALE, src.height * HD_SCALE):
+        return float("inf")
+    small = np.asarray(out.resize(src.size, Image.BOX), dtype=np.float32)
+    return float(np.abs(small - np.asarray(src, dtype=np.float32)).mean())
+
+
+def verify_batch(src_dir: Path, dest_dir: Path, redo) -> None:
+    redone = 0
+    for src in sorted(src_dir.glob("*.png")):
+        out = dest_dir / src.name
+        if out.is_file() and batch_output_diff(src, out) <= BATCH_OUTPUT_MAX_DIFF:
+            continue
+        redo(src, out)
+        redone += 1
+        diff = batch_output_diff(src, out) if out.is_file() else float("inf")
+        if diff > BATCH_OUTPUT_MAX_DIFF:
+            print(f"  warning: {out.name} still differs from its source after a single-file redo ({diff:.1f})")
+    if redone:
+        print(f"  {redone} corrupt batch output(s) in {dest_dir.name} redone single-file")
+
+
 def run_esrgan_batch(src_dir: Path, dest_dir: Path, model: str) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     args = [str(config.REALESRGAN_EXE), "-i", str(src_dir), "-o", str(dest_dir), "-s", str(HD_SCALE), "-n", model]
     result = subprocess.run(args, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"realesrgan batch failed on {src_dir}:\n{result.stdout}\n{result.stderr}")
+    verify_batch(src_dir, dest_dir, lambda s, d: run_esrgan(s, d, model))
 
 
+# -j 1:1:1: with the default 1:2:2 directory mode writes garbage (noise,
+# black, even another input's image under this name) for most frames of a
+# mixed-size batch - 47 of 49 in the x16 trial - and still exits 0.
 def run_realcugan_batch(src_dir: Path, dest_dir: Path) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     args = [
         str(config.REALCUGAN_EXE), "-i", str(src_dir), "-o", str(dest_dir),
-        "-s", str(HD_SCALE), "-n", "-1", "-m", str(config.REALCUGAN_MODEL_DIR),
+        "-s", str(HD_SCALE), "-n", "-1", "-m", str(config.REALCUGAN_MODEL_DIR), "-j", "1:1:1",
     ]
     result = subprocess.run(args, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"realcugan batch failed on {src_dir}:\n{result.stdout}\n{result.stderr}")
+    verify_batch(src_dir, dest_dir, run_realcugan)
 
 
 def is_blank_output(img: Image.Image) -> bool:
