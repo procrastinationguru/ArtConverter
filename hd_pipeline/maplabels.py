@@ -3,9 +3,10 @@
 The vanilla labels are ~6 px tall. Every upscaler (ESRGAN, CUGAN, x16->x4)
 guesses letters at that size ("GLIMMLRING FOUIST"), so the HD map erases
 them and draws them again with IM Fell English SC (OFL, fonts/OFL.txt) -
-an old-style small-caps face close to the map's lettering. Each line is
-rendered big, cropped to its ink and resized onto the vanilla line's ink
-box, so position, width and cap height match the original exactly. The
+an old-style small-caps face close to the map's lettering. Every label uses
+one font size (stretching each line into its own measured box made them
+visibly different - Thanatos vs Cattan); each line is centred on the
+vanilla line with its baseline on the line's bottom edge. The
 tiny "The World of" / subtitle text in the cartouche is left alone (not
 readable even in vanilla); "Arcanum" is big enough that ESRGAN keeps it.
 """
@@ -31,14 +32,28 @@ LABELS = [
 ]
 
 
-def _glyph_mask(text: str, w: int, h: int) -> np.ndarray:
-    """Text rendered at 64 px, cropped to its ink, resized to w x h (0..1)."""
-    f = ImageFont.truetype(str(FONT), 64)
+SUPERSAMPLE = 4
+
+
+def _font_size(cap_px: float) -> int:
+    """Font size whose capital height is `cap_px`."""
+    f = ImageFont.truetype(str(FONT), 100)
+    bb = f.getbbox("H")
+    return max(8, round(cap_px * 100 / (bb[3] - bb[1])))
+
+
+def _glyph_mask(text: str, size: int) -> np.ndarray:
+    """Text at font `size` (rendered 4x larger and box-filtered down for
+    clean edges), cropped to its ink (alpha 0..1). Small caps have no
+    descenders, so the ink bottom is the baseline."""
+    f = ImageFont.truetype(str(FONT), size * SUPERSAMPLE)
     bb = f.getbbox(text)
-    im = Image.new("L", (bb[2] - bb[0] + 8, bb[3] - bb[1] + 8), 0)
-    ImageDraw.Draw(im).text((4 - bb[0], 4 - bb[1]), text, font=f, fill=255)
+    im = Image.new("L", (bb[2] - bb[0] + 16, bb[3] - bb[1] + 16), 0)
+    ImageDraw.Draw(im).text((8 - bb[0], 8 - bb[1]), text, font=f, fill=255)
     im = im.crop(im.getbbox())
-    return np.asarray(im.resize((w, h), Image.LANCZOS), np.float32) / 255
+    w = max(1, round(im.width / SUPERSAMPLE))
+    h = max(1, round(im.height / SUPERSAMPLE))
+    return np.asarray(im.resize((w, h), Image.BOX), np.float32) / 255
 
 
 def reletter(vanilla: Image.Image, hd: Image.Image) -> Image.Image:
@@ -47,6 +62,12 @@ def reletter(vanilla: Image.Image, hd: Image.Image) -> Image.Image:
     van = np.asarray(vanilla.convert("RGB"))
     out = np.asarray(hd.convert("RGB")).astype(np.float32)
     s = hd.width // vanilla.width
+    # One size for every label (the vanilla lettering is one size too; the
+    # measured boxes only differ by a pixel of anti-aliasing each way):
+    # capitals as tall as the median line box, less the half pixel of
+    # anti-aliasing the box includes (full height ran Thanatos into its
+    # coastline).
+    size = _font_size((float(np.median([b[3] - b[1] for label in LABELS for _, b in label])) - 0.5) * s)
     for label in LABELS:
         x0 = min(b[0] for _, b in label) - 1
         y0 = min(b[1] for _, b in label) - 1
@@ -70,8 +91,12 @@ def reletter(vanilla: Image.Image, hd: Image.Image) -> Image.Image:
         xs = slice(max(0, x0 * s - pad), x1 * s + pad)
         out[ys, xs] = inpaint_colorkey(out[ys, xs], mask[ys, xs], max_iter=200)
         for text, (bx0, by0, bx1, by1) in label:
-            w, h = (bx1 - bx0) * s, (by1 - by0) * s
-            a = _glyph_mask(text, w, h)[..., None]
-            region = out[by0 * s:by0 * s + h, bx0 * s:bx0 * s + w]
-            out[by0 * s:by0 * s + h, bx0 * s:bx0 * s + w] = region * (1 - a) + ink * a
+            mask = _glyph_mask(text, size)
+            h, w = mask.shape
+            # centred on the vanilla line, baseline on its bottom edge
+            gx = round((bx0 + bx1) * s / 2 - w / 2)
+            gy = by1 * s - h
+            a = mask[..., None]
+            region = out[gy:gy + h, gx:gx + w]
+            out[gy:gy + h, gx:gx + w] = region * (1 - a) + ink * a
     return Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8))
