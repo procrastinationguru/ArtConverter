@@ -785,6 +785,28 @@ def dedither(rgb: np.ndarray, key: np.ndarray) -> np.ndarray:
     return np.clip(rgb * (1.0 - w) + blur * w + 0.5, 0, 255).astype(np.uint8)
 
 
+def checker_average(rgb: np.ndarray, key: np.ndarray) -> np.ndarray:
+    """uint8 RGB -> uint8 RGB with each strict-checkerboard pixel replaced by
+    the mean of itself and its 4 neighbours' mean - exactly the 50/50 blend
+    the dither stands for. Unlike dedither()'s Gaussian it leaves the shape
+    edges of a dithered hover glow sharp (the whole-disc glows of the HUD
+    round buttons came out as mush through dedither())."""
+    w = dither_weight(rgb, key)
+    if w.max() == 0.0:
+        return rgb
+    f = rgb.astype(np.float32)
+    p = np.pad(f, ((1, 1), (1, 1), (0, 0)), mode="edge")
+    kp = np.pad(key, 1, mode="edge")
+    s = np.zeros_like(f)
+    c = np.zeros(f.shape[:2], np.float32)
+    for n, k in ((p[:-2, 1:-1], kp[:-2, 1:-1]), (p[2:, 1:-1], kp[2:, 1:-1]), (p[1:-1, :-2], kp[1:-1, :-2]), (p[1:-1, 2:], kp[1:-1, 2:])):
+        s += n * (~k)[..., None]
+        c += ~k
+    avg = 0.5 * f + 0.5 * s / np.maximum(c, 1)[..., None]
+    w = w[..., None]
+    return np.clip(f * (1.0 - w) + avg * w + 0.5, 0, 255).astype(np.uint8)
+
+
 # Categories whose sidecars get smooth_alpha() (the AA pass) as they are
 # written. Not wall/roof/facade/tile: those pieces butt against each other,
 # and a softened edge on both sides of a joint would show as a seam.
@@ -2125,6 +2147,48 @@ def read_capture_manifest() -> dict[tuple[str, int, int], list[dict]]:
     return out
 
 
+def cmd_hd_buttons(names: list[str], model: str | None = None) -> None:
+    """Re-upscale interface buttons one frame at a time with checker_average()
+    instead of dedither() (dithered hover/press glows), without hd-compose's
+    in-context step. Each frame is its own verified ESRGAN run (no directory
+    batch). Previous sidecars go to work/_button_originals/ once."""
+    esrgan_model = model or config.REALESRGAN_MODEL
+    stage = config.WORK_DIR / "_buttons"
+    stage.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        rel = name if "/" in name else f"art/interface/{name}.ART"
+        wd = cmd_unpack(rel, quiet=True)
+        basename = Path(rel).name.rsplit(".", 1)[0]
+        num_frames, animated = read_ini_frame_count(wd / (basename + ".ini"))
+        out_dir = hd_out_dir(rel)
+        backup = config.WORK_DIR / "_button_originals" / out_dir.relative_to(config.HD_OVERLAY_DIR)
+        if out_dir.is_dir() and not backup.exists():
+            shutil.copytree(out_dir, backup)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for rot, frame, bmp in hd_frame_bmps(wd, basename, num_frames, animated):
+            w, h = read_bmp_dims(bmp)
+            h = abs(h)
+            indices = np.asarray(read_bmp_indices(bmp), dtype=np.uint8).reshape(h, w)
+            palette = np.asarray(read_bmp_palette(bmp), dtype=np.uint8).reshape(256, 3)
+            key = indices == 0
+            src = np.clip(inpaint_colorkey(palette[indices], key), 0, 255).astype(np.uint8)
+            src = checker_average(src, key)
+            src_png = stage / f"{basename}_{rot}_{frame}.png"
+            hd_png = stage / f"{basename}_{rot}_{frame}_x4.png"
+            Image.fromarray(src, "RGB").save(src_png)
+            run_esrgan(src_png, hd_png, esrgan_model)
+            hd = load_and_validate(hd_png, (w * HD_SCALE, h * HD_SCALE), "hd-buttons")
+            flat = src.reshape(-1, 3)
+            if not np.all(flat == flat[0]) and is_blank_output(hd):
+                raise RuntimeError(f"realesrgan produced blank output for {bmp}")
+            mask_rgb = Image.fromarray(np.where(key, 0, 255).astype(np.uint8), "L").convert("RGB")
+            rgba = hd.convert("RGB")
+            rgba.putalpha(hqx.hq4x(mask_rgb).convert("L"))
+            dest = out_dir / f"r{rot}_f{frame}.png"
+            write_sidecar(rel, dest, rgba)
+            print(f"  {bmp.name} -> {dest.relative_to(config.HD_OVERLAY_DIR)}")
+
+
 def cmd_hd_compose(only: str | None = None, model: str | None = None, dry_run: bool = False) -> None:
     """Rebuild every captured interface frame's sidecar from an in-context
     upscale (see the block comment above). The first run keeps each frame's
@@ -2321,6 +2385,10 @@ def main() -> None:
     p_compose.add_argument("--model", default=None, help="Force one ncnn model (default: config.REALESRGAN_MODEL)")
     p_compose.add_argument("--dry-run", action="store_true", help="Only report which captured frames are usable")
 
+    p_buttons = sub.add_parser("hd-buttons", help="Re-upscale interface buttons frame by frame with the exact checker de-dither (hover glows); originals kept in work/_button_originals/")
+    p_buttons.add_argument("names", nargs="+", help="interface art names (Skills_Button) or rel paths")
+    p_buttons.add_argument("--model", default=None)
+
     p_scan = sub.add_parser("hd-scan", help="Find (and with --fix redo) hd/art sidecars written from corrupt ncnn batch output")
     p_scan.add_argument("categories", nargs="+")
     p_scan.add_argument("--workers", type=int, default=8)
@@ -2395,6 +2463,9 @@ def main() -> None:
         cmd_hd_compose(only=args.only, model=args.model, dry_run=args.dry_run)
         return
 
+    if args.command == "hd-buttons":
+        cmd_hd_buttons(args.names, model=args.model)
+        return
     if args.command == "hd-scan":
         cmd_hd_scan(args.categories, workers=args.workers, fix=args.fix, model=args.model)
         return
