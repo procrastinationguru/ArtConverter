@@ -2055,7 +2055,9 @@ def cmd_hd_background_matte() -> None:
 
 HD_CAPTURE_DIR = config.ARCANUM_ROOT / "hd_capture"
 CAPTURE_ARCHIVE_DIR = config.WORK_DIR / "_captures"
-COMPOSE_DOUBLE_MAX = 160
+# 0 = off. The x16 -> x4 double pass (was 160) lost to plain x4 in the
+# user's 49-sample comparison (comparison/x16_trial/, 2026-09-26).
+COMPOSE_DOUBLE_MAX = 0
 COMPOSE_MASK_EDGE = (0.3, 0.7)
 BLT_FLIP_X = 0x1
 BLT_FLIP_Y = 0x2
