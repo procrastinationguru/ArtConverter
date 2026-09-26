@@ -17,14 +17,20 @@ the licences are mixed (system fonts may not be redistributed).
 | Garmond6/8/9Font | Garamond | EBGaramond.ttf (stand-in) | Google Fonts, OFL |
 | BookmanOldBold18Font | Bookman Old Style Bold | texgyrebonum-bold.otf (stand-in) | CTAN TeX Gyre Bonum, GUST font licence |
 | Swiss921Font | Bitstream Swiss 921 | Anton-Regular.ttf (stand-in) | Google Fonts, OFL |
+| CasablancaAntique30Font, casablanca16font | Corel Casablanca Antique (= Caslon Antique) | IMFeENrm28P.ttf (IM Fell English, stand-in) | Google Fonts, OFL |
+| Zurich16/20Font | Bitstream Zurich (= Univers), condensed | ArchivoNarrow[wght].ttf at wght 700 (stand-in) | Google Fonts, OFL |
+| LatinXCN30Font | Latin Extra Condensed (caps only) | StintUltraCondensed-Regular.ttf, upper case (stand-in) | Google Fonts, OFL |
+| ClarendonBLK18Font | Clarendon Black | Coustard-Black.ttf (stand-in) | Google Fonts, OFL |
+| Flare12/14Font | Corel Flareserif 821 (= Albertus), bold | AlegreyaSans-ExtraBold.ttf (stand-in) | Google Fonts, OFL |
+| Elga12Font | unidentified heavy old-style serif | CrimsonPro[wght].ttf at wght 800 (stand-in) | Google Fonts, OFL |
+| Euph30Font | unidentified condensed Victorian serif | Grenze[wght].ttf at wght 700 (stand-in) | Google Fonts, OFL |
+| Nick16Font | unidentified, Nicolas Cochin style | LindenHill-Regular.ttf (stand-in) | Google Fonts, OFL |
+| Pepper20Font | unidentified pen italic | Fondamento-Italic.ttf (stand-in) | Google Fonts, OFL |
+| pork12font | unidentified rough antique serif | IMFePIrm28P.ttf (IM Fell DW Pica, stand-in) | Google Fonts, OFL |
 
-Not here: commercial Corel/Bitstream faces with no free original:
-CasablancaAntique30Font / casablanca16font (Corel's Caslon Antique; the
-map labels already use IM Fell English, ../), Zurich16/20Font (Bitstream
-Zurich = Univers), LatinXCN30Font (Latin Extra Condensed),
-ClarendonBLK18Font (Clarendon Black), Flare12/14Font (Corel Flareserif 821 =
-Albertus), and the unidentified Elga12, Euph30, Nick16, Pepper20 (script)
-and pork12.
+Stand-ins were picked by eye against the vanilla glyphs:
+comparison/font_lookalikes/<font art>.png (vanilla at x4 nearest above,
+the stand-in below).
 
 Image sheets, not typefaces: BookImagesFont, NewsIconsFont, Icons17/32Font,
 MPIconsFont, rollerfont.
