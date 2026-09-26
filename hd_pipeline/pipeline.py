@@ -1293,7 +1293,9 @@ def cmd_hd_worldmap_zoomed(esrgan_model: str) -> Path | None:
     blits it through a *scaling* tig_video_buffer_blit into a small on-screen
     pane, so the extra source resolution here is close to imperceptible on
     screen - included anyway since it's cheap and the machinery already
-    exists (same straight-ESRGAN pattern as cmd_hd_slides/cmd_hd_splash)."""
+    exists (same straight-ESRGAN pattern as cmd_hd_slides/cmd_hd_splash).
+    The place names are then drawn again with a real font (maplabels.py) -
+    ESRGAN garbles 6 px letters."""
     src = config.WORLDMAP_ROOT / f"{config.WORLDMAP_ZOOMED_BASENAME}.bmp"
     if not src.is_file():
         return None
@@ -1305,7 +1307,8 @@ def cmd_hd_worldmap_zoomed(esrgan_model: str) -> Path | None:
     run_esrgan(src_png, out_png, esrgan_model)
     dest = config.WORLDMAP_OUTPUT_DIR / f"{config.WORLDMAP_ZOOMED_BASENAME}.bmp"
     dest.parent.mkdir(parents=True, exist_ok=True)
-    Image.open(out_png).convert("RGB").save(dest, "BMP")
+    import maplabels
+    maplabels.reletter(Image.open(src), Image.open(out_png)).save(dest, "BMP")
     src_png.unlink(missing_ok=True)
     out_png.unlink(missing_ok=True)
     return dest
