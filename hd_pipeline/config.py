@@ -152,8 +152,9 @@ FACE_MODELS = {"gfpgan": "GFPGANv1.4.pth", "restoreformer": "RestoreFormer.pth"}
 PORTRAIT_FACE_MODEL = "gfpgan"  # trial only - user keeps ESRGAN portraits
 # Tiny faces on the splash screens: (x, y) face centre in vanilla px, half
 # size of the square crop fed to the model (face ~ 60% of it), model.
-# RestoreFormer won on Virgil (GFPGAN made a different, younger man).
-SPLASH_FACES = {"Splash2": [((351, 126), 16, "restoreformer")]}
+# RestoreFormer did best on Virgil (Splash2, ((351, 126), 16,
+# "restoreformer")) but the user kept the plain ESRGAN splash for now.
+SPLASH_FACES: dict = {}
 
 # Intro/logo Bink videos (SierraLogo.bik, TroikaLogo.bik - the only .bik files
 # that exist anywhere in this install, confirmed via undat -l across all 5
