@@ -140,6 +140,21 @@ SPLASH_DIR = _DAT_UNPACKED / "arcanum2" / "art" / "splash"
 # vanilla VFS path, just prefixed.
 PORTRAIT_DIR = _DAT_UNPACKED / "arcanum3" / "portrait"
 
+# Face restoration (faces.py, torch + spandrel, CUDA). ESRGAN melts small
+# faces - it has no idea what a face is. GFPGAN v1.4 / RestoreFormer are
+# FFHQ face models (512x512, face centred at ~70% of the frame). Weights:
+# github.com/TencentARC/GFPGAN releases v1.3.4 (GFPGANv1.4.pth,
+# RestoreFormer.pth). Input is always the vanilla face (Lanczos), never the
+# ESRGAN output: ESRGAN's smears survive restoration, a blurry-but-true face
+# doesn't (comparison/face_restore/).
+FACE_MODEL_DIR = Path(r"G:\coding\repos\art-converter\real-esrgan\face")
+FACE_MODELS = {"gfpgan": "GFPGANv1.4.pth", "restoreformer": "RestoreFormer.pth"}
+PORTRAIT_FACE_MODEL = "gfpgan"  # trial only - user keeps ESRGAN portraits
+# Tiny faces on the splash screens: (x, y) face centre in vanilla px, half
+# size of the square crop fed to the model (face ~ 60% of it), model.
+# RestoreFormer won on Virgil (GFPGAN made a different, younger man).
+SPLASH_FACES = {"Splash2": [((351, 126), 16, "restoreformer")]}
+
 # Intro/logo Bink videos (SierraLogo.bik, TroikaLogo.bik - the only .bik files
 # that exist anywhere in this install, confirmed via undat -l across all 5
 # .dat archives). FFMPEG_EXE decodes/re-encodes; REALESRGAN_EXE upscales the

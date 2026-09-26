@@ -472,7 +472,11 @@ def cmd_hd_splash(force: bool = False) -> None:
             out_png = tmp_dir / f"{bmp.stem}_hd.png"
             run_esrgan(src_png, out_png, config.REALESRGAN_MODEL)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            Image.open(out_png).convert("RGB").save(dest, "BMP")
+            hd = Image.open(out_png).convert("RGB")
+            if bmp.stem in config.SPLASH_FACES:
+                import faces
+                hd = faces.patch_splash_faces(bmp.stem, Image.open(bmp), hd)
+            hd.save(dest, "BMP")
             print(f"  {bmp.name} -> hd/splash/{dest.name}")
             done += 1
         except Exception as e:
@@ -500,6 +504,9 @@ def cmd_hd_portraits(force: bool = False) -> None:
     portraits (NPCArr, NPCBane, ...) that have no "_b" companion in vanilla
     at all. Generating the small HD variant for a file that HAS a "_b"
     sibling would just be dead weight the engine never loads.
+
+    Face restoration (faces.restore_portrait) was tried 2026-09-26 and
+    rejected by the user - ESRGAN portraits stay (comparison/face_restore/).
     """
     tmp_dir = config.WORK_DIR / "_portrait_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)

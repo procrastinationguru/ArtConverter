@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 *.log
 /upscayl-models/
+real-esrgan/face
