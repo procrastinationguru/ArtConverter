@@ -2164,8 +2164,7 @@ REMACRI_UI = (
      "S_GoodNecro", "S_Mental", "S_Meta", "s_morph", "S_Nature", "s_phantasm", "S_Summoning",
      "S_Temporal", "S_Water"]
     + [f"S_{c}{n}" for c in _COLLEGES for n in range(1, 6)]
-    + ("Skills_Button Spells_Button Schematics_Button char_Common_Skills "
-       "Char_But Char_ON Invn_But Invn_ON Log_But Log_ON TMap_But TMap_ON WMap_But WMap_ON "
+    + ("Char_But Char_ON Invn_But Invn_ON Log_But Log_ON TMap_But TMap_ON WMap_But WMap_ON "
        "Combat_But Combat_Button Anatomical_But Chemistry_But Electrical_But Explosives_But "
        "GunSmithy_But Mechanical_But Smithy_But Therapeutics_But Technological_But Social_But "
        "Thieving_But Anatomical_Tab Chemistry_Tab Electrical_Tab Explosives_Tab GunSmithy_Tab "
@@ -2173,10 +2172,12 @@ REMACRI_UI = (
        "Tab_Keys Tab_Note Tab_Quest Tab_Rep").split()
 )
 BUTTON_MODEL.update({name: "remacri-4x" for name in REMACRI_UI})
-# Charedit skill category buttons (key / gear / swap): back to x4plus after
-# the in-game check (remacri stripes their hatched fills).
+# Back to x4plus after the in-game check (remacri stripes their hatched
+# fills): charedit skill category buttons (key / gear / swap) and the four
+# big Skills/Spells/Schematics/common-skills buttons (round 8, twice).
 BUTTON_MODEL.update({name: "realesrgan-x4plus" for name in
-                     ("Thieving_But", "Technological_But", "Social_But")})
+                     ("Thieving_But", "Technological_But", "Social_But",
+                      "Skills_Button", "Spells_Button", "Schematics_Button", "char_Common_Skills")})
 # Round 8 remacri pass (user: remacri wins on small assets - checked in game,
 # then fixed one by one): A = small arrow / +- controls, B = small symbol
 # icons, C = cursors. See docs/ROUND8_PLAN.md.
