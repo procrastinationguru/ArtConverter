@@ -2150,13 +2150,29 @@ def read_capture_manifest() -> dict[tuple[str, int, int], list[dict]]:
 # Per-art ESRGAN model exceptions to config.REALESRGAN_MODEL (user picks from
 # comparison/button_models/, round 8): thin details the default smears.
 BUTTON_MODEL = {
-    "Skills_Button": "realesrgan-x4plus",
-    "Spells_Button": "realesrgan-x4plus",
-    "Schematics_Button": "realesrgan-x4plus",
-    "char_Common_Skills": "realesrgan-x4plus",
     "Char_Plus": "remacri-4x",
     "Char_Minus": "remacri-4x",
 }
+_COLLEGES = ("Air Conveyance Divination Earth EvilNecro Fire Force GoodNecro Mental Meta "
+             "Morph Nature Phantasm Summoning Temporal Water").split()
+# Round 8, second remacri pass (user picked from comparison/remacri_audit/ S,
+# F, D sheets): college circles + spell-level squares, the four big HUD
+# buttons (were x4plus), round HUD buttons, discipline buttons/tabs,
+# logbook tabs.
+REMACRI_UI = (
+    ["S_Air", "S_Conveyance", "S_Divination", "S_Earth", "S_EvilNecro", "S_Fire", "S_Forc",
+     "S_GoodNecro", "S_Mental", "S_Meta", "s_morph", "S_Nature", "s_phantasm", "S_Summoning",
+     "S_Temporal", "S_Water"]
+    + [f"S_{c}{n}" for c in _COLLEGES for n in range(1, 6)]
+    + ("Skills_Button Spells_Button Schematics_Button char_Common_Skills "
+       "Char_But Char_ON Invn_But Invn_ON Log_But Log_ON TMap_But TMap_ON WMap_But WMap_ON "
+       "Combat_But Combat_Button Anatomical_But Chemistry_But Electrical_But Explosives_But "
+       "GunSmithy_But Mechanical_But Smithy_But Therapeutics_But Technological_But Social_But "
+       "Thieving_But Anatomical_Tab Chemistry_Tab Electrical_Tab Explosives_Tab GunSmithy_Tab "
+       "Mechanical_Tab Smithy_Tab Theraputics_Tab Tab_BackGrnd Tab_BlessCurse Tab_EgoInjure "
+       "Tab_Keys Tab_Note Tab_Quest Tab_Rep").split()
+)
+BUTTON_MODEL.update({name: "remacri-4x" for name in REMACRI_UI})
 # Round 8 remacri pass (user: remacri wins on small assets - checked in game,
 # then fixed one by one): A = small arrow / +- controls, B = small symbol
 # icons, C = cursors. See docs/ROUND8_PLAN.md.
@@ -2246,8 +2262,8 @@ FONT_TTF = {
     "art/interface/Courier10Font.ART": ("cour.ttf", None),
     "art/interface/Elga12Font.ART": ("CrimsonPro[wght].ttf", 800),
     "art/interface/Euph30Font.ART": ("Grenze[wght].ttf", 400),
-    "art/interface/Flare12Font.ART": ("Fondamento-Regular.ttf", None),
-    "art/interface/Flare14Font.ART": ("Fondamento-Regular.ttf", None),
+    "art/interface/Flare12Font.ART": ("Grenze[wght].ttf", 400),
+    "art/interface/Flare14Font.ART": ("Grenze[wght].ttf", 400),
     "art/interface/LogbookFont.ART": ("MsMadi-Regular.ttf", None),
     "art/interface/Garmond6Font.ART": ("EBGaramond.ttf", 600),
     "art/interface/Garmond8Font.ART": ("EBGaramond.ttf", 600),
