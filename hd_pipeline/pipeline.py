@@ -2147,6 +2147,18 @@ def read_capture_manifest() -> dict[tuple[str, int, int], list[dict]]:
     return out
 
 
+# Per-art ESRGAN model exceptions to config.REALESRGAN_MODEL (user picks from
+# comparison/button_models/, round 8): thin details the default smears.
+BUTTON_MODEL = {
+    "Skills_Button": "realesrgan-x4plus",
+    "Spells_Button": "realesrgan-x4plus",
+    "Schematics_Button": "realesrgan-x4plus",
+    "char_Common_Skills": "realesrgan-x4plus",
+    "Char_Plus": "remacri-4x",
+    "Char_Minus": "remacri-4x",
+}
+
+
 def cmd_hd_buttons(names: list[str], model: str | None = None) -> None:
     """Re-upscale interface buttons one frame at a time with checker_average()
     instead of dedither() (dithered hover/press glows), without hd-compose's
@@ -2159,6 +2171,7 @@ def cmd_hd_buttons(names: list[str], model: str | None = None) -> None:
         rel = name if "/" in name else f"art/interface/{name}.ART"
         wd = cmd_unpack(rel, quiet=True)
         basename = Path(rel).name.rsplit(".", 1)[0]
+        esrgan_model = model or BUTTON_MODEL.get(basename, config.REALESRGAN_MODEL)
         num_frames, animated = read_ini_frame_count(wd / (basename + ".ini"))
         out_dir = hd_out_dir(rel)
         backup = config.WORK_DIR / "_button_originals" / out_dir.relative_to(config.HD_OVERLAY_DIR)
