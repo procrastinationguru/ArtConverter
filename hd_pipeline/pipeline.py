@@ -2202,7 +2202,7 @@ FONT_TTF = {
     "art/interface/Comic12Font.ART": ("comic.ttf", None),
     "art/interface/Courier10Font.ART": ("cour.ttf", None),
     "art/interface/Elga12Font.ART": ("CrimsonPro[wght].ttf", 800),
-    "art/interface/Euph30Font.ART": ("Grenze[wght].ttf", 700),
+    "art/interface/Euph30Font.ART": ("Grenze[wght].ttf", 400),
     "art/interface/Flare12Font.ART": ("AlegreyaSans-ExtraBold.ttf", None),
     "art/interface/Flare14Font.ART": ("AlegreyaSans-ExtraBold.ttf", None),
     "art/interface/Garmond6Font.ART": ("EBGaramond.ttf", 600),
@@ -2337,10 +2337,28 @@ def cmd_hd_fonts(only: str | None = None) -> None:
                     if tb is not None:
                         g = Image.fromarray((a[tb[1]:tb[3], tb[0]:tb[2]] * 255).astype(np.uint8), "L")
                         gw = min(W * ss, max(1, int(round(g.width * x_scale))))
-                        g = np.asarray(g.resize((gw, g.height), Image.LANCZOS), dtype=np.float32) / 255.0
+                        # Too tall for the cell (long descenders/ascenders):
+                        # squash the part above / below the baseline that
+                        # overflows, each on its own, so the letter body
+                        # keeps its size.
+                        top = base - tb[1]  # ink top above the baseline
+                        asc = min(max(top, 0), g.height)
+                        desc = g.height - asc
+                        by = baseline * s * ss
+                        if by - top >= 0 and by - top + g.height <= H * ss:
+                            a_h, d_h = asc, desc  # fits: no squash
+                        else:
+                            a_h = min(asc, by)
+                            d_h = min(desc, H * ss - by)
+                        parts = []
+                        if asc > 0 and a_h > 0:
+                            parts.append(g.crop((0, 0, g.width, asc)).resize((gw, a_h), Image.LANCZOS))
+                        if desc > 0 and d_h > 0:
+                            parts.append(g.crop((0, asc, g.width, g.height)).resize((gw, d_h), Image.LANCZOS))
+                        g = np.concatenate([np.asarray(q, dtype=np.float32) / 255.0 for q in parts], axis=0) if parts else np.zeros((1, gw), np.float32)
                         x0 = int(round((vb[0] + vb[2]) / 2 * s * ss - gw / 2))
                         x0 = min(max(x0, 0), W * ss - gw)
-                        y0 = baseline * s * ss - (base - tb[1])
+                        y0 = by - top if (a_h, d_h) == (asc, desc) else by - (a_h if asc > 0 else 0)
                         ys0, ys1 = max(0, y0), min(H * ss, y0 + g.shape[0])
                         if ys1 > ys0:
                             cell[ys0:ys1, x0:x0 + gw] = g[ys0 - y0:ys1 - y0]
