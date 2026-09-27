@@ -28,7 +28,7 @@ LABELS = [
     [("Morbihan", (210, 180, 249, 187)), ("Plains", (218, 188, 243, 195))],
     [("Stonewall", (106, 216, 150, 223)), ("Range", (106, 223, 130, 230))],
     [("Thanatos", (218, 314, 256, 320))],
-    [("Cattan", (127, 318, 151, 325))],
+    [("Cattan", (125, 318, 151, 325))],
 ]
 
 
@@ -67,7 +67,7 @@ def reletter(vanilla: Image.Image, hd: Image.Image) -> Image.Image:
     # capitals as tall as the median line box, less the half pixel of
     # anti-aliasing the box includes (full height ran Thanatos into its
     # coastline).
-    size = _font_size((float(np.median([b[3] - b[1] for label in LABELS for _, b in label])) - 0.5) * s)
+    size = _font_size((float(np.median([b[3] - b[1] for label in LABELS for _, b in label])) - 1.0) * s)
     for label in LABELS:
         x0 = min(b[0] for _, b in label) - 1
         y0 = min(b[1] for _, b in label) - 1
@@ -93,8 +93,13 @@ def reletter(vanilla: Image.Image, hd: Image.Image) -> Image.Image:
         for text, (bx0, by0, bx1, by1) in label:
             mask = _glyph_mask(text, size)
             h, w = mask.shape
-            # centred on the vanilla line, baseline on its bottom edge
-            gx = round((bx0 + bx1) * s / 2 - w / 2)
+            # never wider than the vanilla line (Thanatos ran into its
+            # coast): squeeze to the box
+            if w > (bx1 - bx0) * s:
+                w = (bx1 - bx0) * s
+                mask = np.asarray(Image.fromarray((mask * 255).astype(np.uint8)).resize((w, h), Image.LANCZOS), np.float32) / 255
+            # on the vanilla line: left edge and baseline on its box
+            gx = bx0 * s
             gy = by1 * s - h
             a = mask[..., None]
             region = out[gy:gy + h, gx:gx + w]
