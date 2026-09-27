@@ -2173,6 +2173,10 @@ REMACRI_UI = (
        "Tab_Keys Tab_Note Tab_Quest Tab_Rep").split()
 )
 BUTTON_MODEL.update({name: "remacri-4x" for name in REMACRI_UI})
+# Charedit skill category buttons (key / gear / swap): back to x4plus after
+# the in-game check (remacri stripes their hatched fills).
+BUTTON_MODEL.update({name: "realesrgan-x4plus" for name in
+                     ("Thieving_But", "Technological_But", "Social_But")})
 # Round 8 remacri pass (user: remacri wins on small assets - checked in game,
 # then fixed one by one): A = small arrow / +- controls, B = small symbol
 # icons, C = cursors. See docs/ROUND8_PLAN.md.
@@ -2205,6 +2209,9 @@ REMACRI_SMALL = (
 BUTTON_MODEL.update({name: "remacri-4x" for name in REMACRI_SMALL})
 
 
+BUTTON_MIN_SIDE = 64
+
+
 def cmd_hd_buttons(names: list[str], model: str | None = None) -> None:
     """Re-upscale interface buttons one frame at a time with checker_average()
     instead of dedither() (dithered hover/press glows), without hd-compose's
@@ -2234,12 +2241,21 @@ def cmd_hd_buttons(names: list[str], model: str | None = None) -> None:
             src = checker_average(src, key)
             src_png = stage / f"{basename}_{rot}_{frame}.png"
             hd_png = stage / f"{basename}_{rot}_{frame}_x4.png"
-            Image.fromarray(src, "RGB").save(src_png)
+            # ncnn returns noise for tiny inputs (remacri on the 38x10
+            # XP pips, 9x9 map markers): edge-pad to BUTTON_MIN_SIDE, crop after.
+            pw, ph = max(0, BUTTON_MIN_SIDE - w), max(0, BUTTON_MIN_SIDE - h)
+            padded = np.pad(src, ((ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2), (0, 0)), mode="edge")
+            Image.fromarray(padded, "RGB").save(src_png)
             run_esrgan(src_png, hd_png, esrgan_model)
-            hd = load_and_validate(hd_png, (w * HD_SCALE, h * HD_SCALE), "hd-buttons")
+            hd = load_and_validate(hd_png, (padded.shape[1] * HD_SCALE, padded.shape[0] * HD_SCALE), "hd-buttons")
+            x0, y0 = pw // 2 * HD_SCALE, ph // 2 * HD_SCALE
+            hd = hd.crop((x0, y0, x0 + w * HD_SCALE, y0 + h * HD_SCALE))
             flat = src.reshape(-1, 3)
             if not np.all(flat == flat[0]) and is_blank_output(hd):
                 raise RuntimeError(f"realesrgan produced blank output for {bmp}")
+            corr = structural_corr(src, np.asarray(hd.convert("RGB").resize((w, h), Image.BOX)), ~key)
+            if corr < BATCH_OUTPUT_MIN_CORR:
+                raise RuntimeError(f"realesrgan output doesn't match {bmp} (corr {corr:.2f})")
             mask_rgb = Image.fromarray(np.where(key, 0, 255).astype(np.uint8), "L").convert("RGB")
             rgba = hd.convert("RGB")
             rgba.putalpha(hqx.hq4x(mask_rgb).convert("L"))
@@ -2262,8 +2278,8 @@ FONT_TTF = {
     "art/interface/Courier10Font.ART": ("cour.ttf", None),
     "art/interface/Elga12Font.ART": ("CrimsonPro[wght].ttf", 800),
     "art/interface/Euph30Font.ART": ("Grenze[wght].ttf", 400),
-    "art/interface/Flare12Font.ART": ("Grenze[wght].ttf", 400),
-    "art/interface/Flare14Font.ART": ("Grenze[wght].ttf", 400),
+    "art/interface/Flare12Font.ART": ("PirataOne-Regular.ttf", None),
+    "art/interface/Flare14Font.ART": ("PirataOne-Regular.ttf", None),
     "art/interface/LogbookFont.ART": ("MsMadi-Regular.ttf", None),
     "art/interface/Garmond6Font.ART": ("EBGaramond.ttf", 600),
     "art/interface/Garmond8Font.ART": ("EBGaramond.ttf", 600),
