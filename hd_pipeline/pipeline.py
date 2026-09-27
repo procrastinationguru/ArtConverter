@@ -2280,6 +2280,58 @@ def _glyph_char(frame: int) -> str | None:
         return None
 
 
+def _fit_glyph(a: np.ndarray, base: int, vb, ch: str, x_scale: float, by: int, cw: int, chh: int, k: int):
+    """Place one TTF-rendered glyph (coverage `a`, baseline row `base`) in
+    its cell (cw x chh, baseline row `by`, all in supersampled px; k =
+    vanilla px -> supersampled px) so its ink lands where the vanilla ink
+    (box `vb`, vanilla px) was. Width: the vanilla ink width, within
+    0.8-1.25 of the font-wide x scale (thin glyphs keep the font scale),
+    centred on the vanilla ink. Height: the font's size on the shared
+    baseline, unless that misses the vanilla ink by more than 1.5 vanilla
+    px at the top or bottom, or it is a digit (old-style figures ->
+    lining): then fitted to the vanilla ink box (0.8-1.25). Whatever still
+    overflows the cell is squashed above / below the baseline separately.
+    Returns (coverage, x0, y0) or None."""
+    tc = _ink_box(a, 0.02)
+    tb = _ink_box(a, 0.5) or tc
+    if tc is None:
+        return None
+    vx0, vy0, vx1, vy1 = (v * k for v in vb)
+    tw, th = max(1, tb[2] - tb[0]), max(1, tb[3] - tb[1])
+    sx = x_scale
+    if vb[2] - vb[0] >= 3:
+        sx = x_scale * float(np.clip((vx1 - vx0) / (tw * x_scale), 0.8, 1.25))
+    sy = 1.0
+    oy = by - (base - tb[1])  # cell row of the ink-box top on the shared baseline
+    tol = 1.5 * k
+    if vb[3] - vb[1] >= 2 and (ch.isdigit() or abs(oy - vy0) > tol or abs(oy + th - vy1) > tol):
+        want = (vy1 - vy0) / th
+        sy = float(np.clip(want, 0.8, 1.25))
+        oy = vy0 if sy == want else vy1 - th * sy
+    ox = (vx0 + vx1) / 2 - tw * sx / 2
+
+    g = Image.fromarray((a[tc[1]:tc[3], tc[0]:tc[2]] * 255).astype(np.uint8), "L")
+    gw = min(cw, max(1, int(round(g.width * sx))))
+    x0 = int(round(ox + (tc[0] - tb[0]) * sx))
+    x0 = min(max(x0, 0), cw - gw)
+    y0 = int(round(oy + (tc[1] - tb[1]) * sy))
+    asc = min(max(base - tc[1], 0), g.height)  # rows above the baseline
+    desc = g.height - asc
+    a_h, d_h = int(round(asc * sy)), int(round(desc * sy))
+    bl = y0 + a_h  # cell row of the baseline
+    if y0 < 0 or bl + d_h > chh:
+        a_h, d_h = min(a_h, max(bl, 0)), min(d_h, max(chh - bl, 0))
+        y0 = bl - a_h
+    parts = []
+    if asc > 0 and a_h > 0:
+        parts.append(g.crop((0, 0, g.width, asc)).resize((gw, a_h), Image.LANCZOS))
+    if desc > 0 and d_h > 0:
+        parts.append(g.crop((0, asc, g.width, g.height)).resize((gw, d_h), Image.LANCZOS))
+    if not parts:
+        return None
+    return np.concatenate([np.asarray(q, dtype=np.float32) / 255.0 for q in parts], axis=0), x0, y0
+
+
 def cmd_hd_fonts(only: str | None = None) -> None:
     """Glyph sidecars for the vanilla bitmap fonts, rendered from TTFs
     (FONT_TTF) instead of upscaled: white with the coverage as alpha (the
@@ -2288,7 +2340,8 @@ def cmd_hd_fonts(only: str | None = None) -> None:
     (4x size, same baseline, ink centred where the vanilla ink was), so text
     layout - advances, wrapping, centring - is unchanged. Size: the TTF's
     cap height matches the vanilla 'H'; a per-font x scale matches the
-    vanilla letter widths; a glyph still too wide for its cell is squeezed.
+    vanilla letter widths; then each glyph is fitted to its own vanilla ink
+    box (_fit_glyph), so digits and odd letters sit where vanilla's did.
     Glyphs the TTF lacks fall back to a smooth upscale of the vanilla
     coverage."""
     from PIL import ImageDraw, ImageFont
@@ -2371,35 +2424,12 @@ def cmd_hd_fonts(only: str | None = None) -> None:
             elif font is not None and ch is not None and vb is not None and ch.strip():
                 a, base = render(font, ch.upper() if caps else ch)
                 if a.shape != missing.shape or not np.array_equal(a, missing):
-                    tb = _ink_box(a, 0.02)
-                    if tb is not None:
-                        g = Image.fromarray((a[tb[1]:tb[3], tb[0]:tb[2]] * 255).astype(np.uint8), "L")
-                        gw = min(W * ss, max(1, int(round(g.width * x_scale))))
-                        # Too tall for the cell (long descenders/ascenders):
-                        # squash the part above / below the baseline that
-                        # overflows, each on its own, so the letter body
-                        # keeps its size.
-                        top = base - tb[1]  # ink top above the baseline
-                        asc = min(max(top, 0), g.height)
-                        desc = g.height - asc
-                        by = baseline * s * ss
-                        if by - top >= 0 and by - top + g.height <= H * ss:
-                            a_h, d_h = asc, desc  # fits: no squash
-                        else:
-                            a_h = min(asc, by)
-                            d_h = min(desc, H * ss - by)
-                        parts = []
-                        if asc > 0 and a_h > 0:
-                            parts.append(g.crop((0, 0, g.width, asc)).resize((gw, a_h), Image.LANCZOS))
-                        if desc > 0 and d_h > 0:
-                            parts.append(g.crop((0, asc, g.width, g.height)).resize((gw, d_h), Image.LANCZOS))
-                        g = np.concatenate([np.asarray(q, dtype=np.float32) / 255.0 for q in parts], axis=0) if parts else np.zeros((1, gw), np.float32)
-                        x0 = int(round((vb[0] + vb[2]) / 2 * s * ss - gw / 2))
-                        x0 = min(max(x0, 0), W * ss - gw)
-                        y0 = by - top if (a_h, d_h) == (asc, desc) else by - (a_h if asc > 0 else 0)
+                    g = _fit_glyph(a, base, vb, ch, x_scale, baseline * s * ss, W * ss, H * ss, s * ss)
+                    if g is not None:
+                        g, x0, y0 = g
                         ys0, ys1 = max(0, y0), min(H * ss, y0 + g.shape[0])
                         if ys1 > ys0:
-                            cell[ys0:ys1, x0:x0 + gw] = g[ys0 - y0:ys1 - y0]
+                            cell[ys0:ys1, x0:x0 + g.shape[1]] = g[ys0 - y0:ys1 - y0]
                             drawn = True
             if not drawn and vb is not None:
                 up = Image.fromarray((f["cov"] * 255).astype(np.uint8), "L").resize((W * ss, H * ss), Image.LANCZOS)
