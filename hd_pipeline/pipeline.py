@@ -2247,6 +2247,37 @@ def _is_picto(rel: str, ch: str | None, width: int) -> bool:
     if isinstance(picto, int):
         return width >= picto
     return picto is not None and ch is not None and ch in picto
+# Stroke thinning in HD px for single-weight fonts that render too heavy.
+FONT_THIN: dict[str, float] = {}
+# Cap height as a fraction of the vanilla 'H' (fonts with tall loops that
+# would not fit the vanilla cells otherwise).
+FONT_CAP: dict[str, float] = {}
+# Fonts placed with the font-wide scale only (see _fit_glyph).
+FONT_FREE_FIT: set[str] = set()
+
+
+def _thin(cov: np.ndarray, r: float, keep: float) -> np.ndarray:
+    """Erode anti-aliased coverage by up to r px per side, but never thin a
+    stroke below 2*keep px wide (hairlines and serifs survive; only the
+    heavy stems lose weight). Works on the signed distance to the 0.5
+    contour; the result has a ~1 HD px soft edge (4 supersampled px)."""
+    from scipy import ndimage
+    inside = cov >= 0.5
+    din = ndimage.distance_transform_edt(inside)
+    d = np.where(inside, din - 0.5, 0.5 - ndimage.distance_transform_edt(~inside))
+    if r < 0:  # embolden: grow every stroke by -r
+        return np.clip((d - r) / 4.0 + 0.5, 0.0, 1.0)
+    # each pixel's stroke half-width: the inside distance at its nearest
+    # medial-axis (ridge) pixel
+    ridge = inside & (din >= ndimage.maximum_filter(din, size=3))
+    if not ridge.any():
+        return cov
+    _, (iy, ix) = ndimage.distance_transform_edt(~ridge, return_indices=True)
+    half = din[iy, ix]
+    r_eff = np.clip(half - keep, 0.0, r)
+    return np.clip((d - r_eff) / 4.0 + 0.5, 0.0, 1.0) * (cov > 0)
+
+
 FONT_DIR = Path(__file__).resolve().parent / "fonts" / "vanilla"
 
 
@@ -2265,6 +2296,20 @@ def _font_frames(wd: Path, basename: str) -> list[dict]:
     return frames
 
 
+def _font_advances(ini: Path) -> dict[int, int]:
+    """Frame -> advance (hot x, "center_x" in the unpacked ini)."""
+    adv, cur = {}, None
+    for line in ini.read_text(errors="replace").splitlines():
+        m = re.match(r"frame (\d+):", line)
+        if m:
+            cur = int(m.group(1))
+            continue
+        m = re.match(r"center_x: (-?\d+)", line)
+        if m and cur is not None:
+            adv[cur] = int(m.group(1))
+    return adv
+
+
 def _ink_box(a: np.ndarray, thresh: float = 0.25):
     ys, xs = np.nonzero(a > thresh)
     if len(xs) == 0:
@@ -2280,7 +2325,8 @@ def _glyph_char(frame: int) -> str | None:
         return None
 
 
-def _fit_glyph(a: np.ndarray, base: int, vb, ch: str, x_scale: float, by: int, cw: int, chh: int, k: int):
+def _fit_glyph(a: np.ndarray, base: int, vb, ch: str, x_scale: float, by: int, cw: int, chh: int, k: int,
+               pen: int | None = None):
     """Place one TTF-rendered glyph (coverage `a`, baseline row `base`) in
     its cell (cw x chh, baseline row `by`, all in supersampled px; k =
     vanilla px -> supersampled px) so its ink lands where the vanilla ink
@@ -2289,8 +2335,12 @@ def _fit_glyph(a: np.ndarray, base: int, vb, ch: str, x_scale: float, by: int, c
     centred on the vanilla ink. Height: the font's size on the shared
     baseline, unless that misses the vanilla ink by more than 1.5 vanilla
     px at the top or bottom, or it is a digit (old-style figures ->
-    lining): then fitted to the vanilla ink box (0.8-1.25). Whatever still
-    overflows the cell is squashed above / below the baseline separately.
+    lining): then fitted to the vanilla ink box (0.8-1.25). With `pen`
+    (the TTF pen column in `a`): no per-glyph fit, the font-wide scale on
+    the baseline with the pen at the cell's left edge, as the TTF lays it
+    out (fonts nothing like vanilla's, e.g. a joined handwriting whose
+    strokes must meet). Whatever still overflows the cell is squashed
+    above / below the baseline separately.
     Returns (coverage, x0, y0) or None."""
     tc = _ink_box(a, 0.02)
     tb = _ink_box(a, 0.5) or tc
@@ -2298,17 +2348,18 @@ def _fit_glyph(a: np.ndarray, base: int, vb, ch: str, x_scale: float, by: int, c
         return None
     vx0, vy0, vx1, vy1 = (v * k for v in vb)
     tw, th = max(1, tb[2] - tb[0]), max(1, tb[3] - tb[1])
+    free = pen is not None
     sx = x_scale
-    if vb[2] - vb[0] >= 3:
+    if vb[2] - vb[0] >= 3 and not free:
         sx = x_scale * float(np.clip((vx1 - vx0) / (tw * x_scale), 0.8, 1.25))
     sy = 1.0
     oy = by - (base - tb[1])  # cell row of the ink-box top on the shared baseline
     tol = 1.5 * k
-    if vb[3] - vb[1] >= 2 and (ch.isdigit() or abs(oy - vy0) > tol or abs(oy + th - vy1) > tol):
+    if not free and vb[3] - vb[1] >= 2 and (ch.isdigit() or abs(oy - vy0) > tol or abs(oy + th - vy1) > tol):
         want = (vy1 - vy0) / th
         sy = float(np.clip(want, 0.8, 1.25))
         oy = vy0 if sy == want else vy1 - th * sy
-    ox = (vx0 + vx1) / 2 - tw * sx / 2
+    ox = (tb[0] - pen) * sx if free else (vx0 + vx1) / 2 - tw * sx / 2
 
     g = Image.fromarray((a[tc[1]:tc[3], tc[0]:tc[2]] * 255).astype(np.uint8), "L")
     gw = min(cw, max(1, int(round(g.width * sx))))
@@ -2332,7 +2383,8 @@ def _fit_glyph(a: np.ndarray, base: int, vb, ch: str, x_scale: float, by: int, c
     return np.concatenate([np.asarray(q, dtype=np.float32) / 255.0 for q in parts], axis=0), x0, y0
 
 
-def cmd_hd_fonts(only: str | None = None) -> None:
+def cmd_hd_fonts(only: str | None = None, ttf_override: tuple | None = None,
+                 out_root: Path | None = None) -> None:
     """Glyph sidecars for the vanilla bitmap fonts, rendered from TTFs
     (FONT_TTF) instead of upscaled: white with the coverage as alpha (the
     engine tints them with the font colour, like the vanilla ALPHA_SRC +
@@ -2343,7 +2395,10 @@ def cmd_hd_fonts(only: str | None = None) -> None:
     vanilla letter widths; then each glyph is fitted to its own vanilla ink
     box (_fit_glyph), so digits and odd letters sit where vanilla's did.
     Glyphs the TTF lacks fall back to a smooth upscale of the vanilla
-    coverage."""
+    coverage. FONT_THIN erodes a font's strokes (single-weight TTFs that are
+    too heavy). Trials: ttf_override = (ttf, weight[, thin]) replaces the
+    matched fonts' FONT_TTF entry, out_root puts the sidecars under
+    out_root/<art path> instead of the game's hd folder."""
     from PIL import ImageDraw, ImageFont
 
     s = HD_SCALE
@@ -2351,6 +2406,11 @@ def cmd_hd_fonts(only: str | None = None) -> None:
     for rel, (ttf, weight) in FONT_TTF.items():
         if only is not None and only.lower() not in rel.lower():
             continue
+        thin = FONT_THIN.get(rel, 0.0)
+        cap = FONT_CAP.get(rel, 1.0)
+        free = rel in FONT_FREE_FIT
+        if ttf_override is not None:
+            ttf, weight, thin, cap, free = (tuple(ttf_override) + (0.0, 1.0, False)[len(ttf_override) - 2:])[:5]
         wd = cmd_unpack(rel, quiet=True)
         basename = Path(rel).name.rsplit(".", 1)[0]
         frames = _font_frames(wd, basename)
@@ -2368,26 +2428,28 @@ def cmd_hd_fonts(only: str | None = None) -> None:
             return font
 
         def render(font, ch: str):
-            """(coverage, baseline row) with the glyph's ink box tight."""
+            """(coverage, baseline row, pen column) with the glyph's ink
+            box tight."""
             box = font.getbbox(ch, anchor="ls")
             img = Image.new("L", (max(1, box[2] - box[0] + 8), max(1, box[3] - box[1] + 8)), 0)
             ImageDraw.Draw(img).text((4 - box[0], 4 - box[1]), ch, font=font, fill=255, anchor="ls")
-            return np.asarray(img, dtype=np.float32) / 255.0, 4 - box[1]
+            return np.asarray(img, dtype=np.float32) / 255.0, 4 - box[1], 4 - box[0]
 
         font = None
         size = 0
         ratios = []
+        advances = _font_advances(wd / (basename + ".ini")) if free else {}
         if ttf is not None:
             ref_box = _ink_box(by_char["H"]["cov"])
-            cap_v = (ref_box[3] - ref_box[1]) * s * ss
+            cap_v = (ref_box[3] - ref_box[1]) * s * ss * cap
             baseline = ref_box[3]  # vanilla row just under the 'H'
             size = int(cap_v)
             for _ in range(3):  # cap height -> point size
-                a, _ = render(load(size), "H")
+                a, _, _ = render(load(size), "H")
                 b = _ink_box(a, 0.5)
                 size = max(4, int(round(size * cap_v / max(1, b[3] - b[1]))))
             font = load(size)
-            missing, _ = render(font, "\U0010FFFD")
+            missing, _, _ = render(font, "\U0010FFFD")
 
         # Per-font x scale from the letters' ink widths.
         for ch in "abcdeghknopqrsuvxyzABCDEGHKNOPRSUVXYZ" if font is not None else "":
@@ -2395,13 +2457,19 @@ def cmd_hd_fonts(only: str | None = None) -> None:
             vb = _ink_box(f["cov"]) if f is not None else None
             if vb is None:
                 continue
-            a, _ = render(font, ch.upper() if caps else ch)
+            if free:  # match advances, so joined script letters meet
+                adv = advances.get(f["frame"], 0)
+                length = font.getlength(ch)
+                if adv > 0 and length > 0:
+                    ratios.append(adv * s * ss / length)
+                continue
+            a, _, _ = render(font, ch.upper() if caps else ch)
             tb = _ink_box(a, 0.5)
             if tb is not None and tb[2] > tb[0]:
                 ratios.append((vb[2] - vb[0]) * s * ss / (tb[2] - tb[0]))
-        x_scale = float(np.clip(np.median(ratios), 0.6, 1.15)) if ratios else 1.0
+        x_scale = float(np.clip(np.median(ratios), 0.6, 1.35)) if ratios else 1.0
 
-        out_dir = hd_out_dir(rel)
+        out_dir = hd_out_dir(rel) if out_root is None else out_root / Path(rel).with_suffix("")
         out_dir.mkdir(parents=True, exist_ok=True)
         fallback = 0
         picto = 0
@@ -2422,9 +2490,15 @@ def cmd_hd_fonts(only: str | None = None) -> None:
                 drawn = True
                 picto += 1
             elif font is not None and ch is not None and vb is not None and ch.strip():
-                a, base = render(font, ch.upper() if caps else ch)
+                a, base, pen = render(font, ch.upper() if caps else ch)
                 if a.shape != missing.shape or not np.array_equal(a, missing):
-                    g = _fit_glyph(a, base, vb, ch, x_scale, baseline * s * ss, W * ss, H * ss, s * ss)
+                    gx = x_scale
+                    if free:  # this glyph's pen advance -> its vanilla advance
+                        length = font.getlength(ch.upper() if caps else ch)
+                        if advances.get(f["frame"], 0) > 0 and length > 0:
+                            gx = float(np.clip(advances[f["frame"]] * s * ss / length, x_scale * 0.75, x_scale * 1.33))
+                    g = _fit_glyph(a, base, vb, ch, gx, baseline * s * ss, W * ss, H * ss, s * ss,
+                                   pen if free else None)
                     if g is not None:
                         g, x0, y0 = g
                         ys0, ys1 = max(0, y0), min(H * ss, y0 + g.shape[0])
@@ -2435,6 +2509,8 @@ def cmd_hd_fonts(only: str | None = None) -> None:
                 up = Image.fromarray((f["cov"] * 255).astype(np.uint8), "L").resize((W * ss, H * ss), Image.LANCZOS)
                 cell = np.asarray(up, dtype=np.float32) / 255.0
                 fallback += 1
+            if thin != 0 and drawn and not _is_picto(rel, ch, f["w"]):
+                cell = _thin(cell, thin * ss, 1.5 * ss)
             alpha = Image.fromarray((np.clip(cell, 0, 1) * 255).astype(np.uint8), "L").resize((W, H), Image.BOX)
             rgba = Image.new("RGBA", (W, H), (255, 255, 255, 0))
             rgba.putalpha(alpha)
