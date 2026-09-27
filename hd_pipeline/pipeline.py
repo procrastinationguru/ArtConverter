@@ -2401,23 +2401,29 @@ def _fit_glyph(a: np.ndarray, base: int, vb, ch: str, x_scale: float, by: int, c
 # transparent inscribed-circle hole the view shows through. The upscaled
 # 1x hole edge is a staircase (#121); replace it with an analytic,
 # anti-aliased circle. (The corners' mismatch with the panel, #110/#111, is
-# handled in the engine - intgame_pc_lens_hd_corners().)
-LENS_RINGS = ["PCWinCvr", "Char_PCC", "Lns_Bart", "Lns_Loot", "Lns_Papr", "OptionsPCLens", "SaveLoadPCLens"]
+# handled in the engine - intgame_pc_lens_hd_corners().) Also the world
+# map's Nav_Cvr, whose round hole (the NavButton socket) had the same
+# staircase plus a dark fringe (#120). Value: radius percentile of the
+# hole's edge pixels to put the circle at (higher trims a dark fringe).
+LENS_RINGS = {
+    "PCWinCvr": 50, "Char_PCC": 50, "Lns_Bart": 50, "Lns_Loot": 50, "Lns_Papr": 50,
+    "OptionsPCLens": 50, "SaveLoadPCLens": 50,
+    "Nav_Cvr": 97,
+}
 
 
-def lens_ring_alpha(rgba: np.ndarray) -> tuple[np.ndarray, float]:
-    """New alpha for a lens ring sidecar: within a band around the hole's
-    edge (median radius of the upscaled staircase) an analytic circle with
-    a 1 px soft edge; everywhere else the original alpha. Returns (alpha
-    0..255, hole radius)."""
+def lens_ring_alpha(rgba: np.ndarray, pct: float = 50) -> tuple[np.ndarray, float]:
+    """New alpha for a ring sidecar with a round transparent hole (the
+    component under the image centre): the circle is least-squares fitted
+    to the hole's edge pixels, its radius set at their `pct` percentile;
+    within a band around it an analytic circle with a 1 px soft edge,
+    everywhere else the original alpha. Returns (alpha 0..255, radius)."""
     from scipy import ndimage
     h, w = rgba.shape[:2]
     a = rgba[..., 3].astype(np.float32) / 255.0
     yy, xx = np.mgrid[:h, :w].astype(np.float32)
     labels, _ = ndimage.label(a < 0.5)
     hole = labels == labels[h // 2, w // 2]
-    cx, cy = w / 2.0, h / 2.0
-    d = np.hypot(xx + 0.5 - cx, yy + 0.5 - cy)
     op = a >= 0.5
     nb = np.zeros_like(op)
     nb[1:, :] |= op[:-1, :]
@@ -2425,7 +2431,15 @@ def lens_ring_alpha(rgba: np.ndarray) -> tuple[np.ndarray, float]:
     nb[:, 1:] |= op[:, :-1]
     nb[:, :-1] |= op[:, 1:]
     edge = hole & nb
-    r_in = float(np.median(d[edge])) if edge.any() else min(w, h) / 2.0
+    if edge.sum() < 16:
+        return rgba[..., 3].copy(), 0.0
+    ex, ey = xx[edge] + 0.5, yy[edge] + 0.5
+    # algebraic circle fit: x^2 + y^2 + D x + E y + F = 0
+    m = np.stack([ex, ey, np.ones_like(ex)], 1)
+    sol, *_ = np.linalg.lstsq(m, -(ex * ex + ey * ey), rcond=None)
+    cx, cy = -sol[0] / 2.0, -sol[1] / 2.0
+    d = np.hypot(xx + 0.5 - cx, yy + 0.5 - cy)
+    r_in = float(np.percentile(d[edge], pct))
     band = np.abs(d - r_in) < 6.0
     alpha = np.where(band, np.clip(d - r_in + 0.5, 0, 1), np.where(hole, 0.0, a))
     return (alpha * 255.0 + 0.5).astype(np.uint8), r_in
@@ -2434,7 +2448,7 @@ def lens_ring_alpha(rgba: np.ndarray) -> tuple[np.ndarray, float]:
 def cmd_hd_lens_rings(only: str | None = None, out_root: Path | None = None) -> None:
     """Smooth the lens ring sidecars' hole edge (see LENS_RINGS). Originals go
     to work/_lens_originals/ once; always rebuilt from those."""
-    for name in LENS_RINGS:
+    for name, pct in LENS_RINGS.items():
         if only is not None and only.lower() not in name.lower():
             continue
         rel = f"art/interface/{name}.ART"
@@ -2446,7 +2460,7 @@ def cmd_hd_lens_rings(only: str | None = None, out_root: Path | None = None) -> 
         dest.mkdir(parents=True, exist_ok=True)
         for src in sorted(backup.glob("r*_f*.png")):
             rgba = np.asarray(Image.open(src).convert("RGBA")).copy()
-            alpha, r_in = lens_ring_alpha(rgba)
+            alpha, r_in = lens_ring_alpha(rgba, pct)
             rgba[..., 3] = alpha
             Image.fromarray(rgba, "RGBA").save(dest / src.name)
             print(f"  {name}/{src.name}: hole radius {r_in:.1f} px")
