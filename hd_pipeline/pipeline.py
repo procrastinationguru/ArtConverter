@@ -2216,8 +2216,9 @@ FONT_TTF = {
     "art/interface/Courier10Font.ART": ("cour.ttf", None),
     "art/interface/Elga12Font.ART": ("CrimsonPro[wght].ttf", 800),
     "art/interface/Euph30Font.ART": ("Grenze[wght].ttf", 400),
-    "art/interface/Flare12Font.ART": ("AlegreyaSans-ExtraBold.ttf", None),
-    "art/interface/Flare14Font.ART": ("AlegreyaSans-ExtraBold.ttf", None),
+    "art/interface/Flare12Font.ART": ("Fondamento-Regular.ttf", None),
+    "art/interface/Flare14Font.ART": ("Fondamento-Regular.ttf", None),
+    "art/interface/LogbookFont.ART": ("MsMadi-Regular.ttf", None),
     "art/interface/Garmond6Font.ART": ("EBGaramond.ttf", 600),
     "art/interface/Garmond8Font.ART": ("EBGaramond.ttf", 600),
     "art/interface/Garmond9Font.ART": ("EBGaramond.ttf", 600),
@@ -2260,13 +2261,20 @@ def _is_picto(rel: str, ch: str | None, width: int) -> bool:
     if isinstance(picto, int):
         return width >= picto
     return picto is not None and ch is not None and ch in picto
-# Stroke thinning in HD px for single-weight fonts that render too heavy.
-FONT_THIN: dict[str, float] = {}
+# Font arts that don't exist in vanilla: a copy of another font art (same
+# cells and advances) the engine loads from the game's data/ folder, so one
+# UI can have its own glyphs. LogbookFont = the logbook body in a
+# handwriting (logbook_ui.c, interface art 4000 in name.c).
+FONT_ALIAS = {"art/interface/LogbookFont.ART": "art/interface/Flare12Font.ART"}
+
+# Stroke thinning in HD px for single-weight fonts that render too heavy;
+# negative emboldens (hairline scripts).
+FONT_THIN: dict[str, float] = {"art/interface/LogbookFont.ART": -0.5}
 # Cap height as a fraction of the vanilla 'H' (fonts with tall loops that
 # would not fit the vanilla cells otherwise).
 FONT_CAP: dict[str, float] = {}
 # Fonts placed with the font-wide scale only (see _fit_glyph).
-FONT_FREE_FIT: set[str] = set()
+FONT_FREE_FIT: set[str] = {"art/interface/LogbookFont.ART"}
 
 
 def _thin(cov: np.ndarray, r: float, keep: float) -> np.ndarray:
@@ -2494,8 +2502,14 @@ def cmd_hd_fonts(only: str | None = None, ttf_override: tuple | None = None,
         free = rel in FONT_FREE_FIT
         if ttf_override is not None:
             ttf, weight, thin, cap, free = (tuple(ttf_override) + (0.0, 1.0, False)[len(ttf_override) - 2:])[:5]
-        wd = cmd_unpack(rel, quiet=True)
-        basename = Path(rel).name.rsplit(".", 1)[0]
+        src_rel = FONT_ALIAS.get(rel, rel)
+        if src_rel != rel:
+            # the engine's copy of the source art (data/ is a file repository)
+            dest = config.HD_OVERLAY_DIR.parent / "data" / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(find_source_art(src_rel), dest)
+        wd = cmd_unpack(src_rel, quiet=True)
+        basename = Path(src_rel).name.rsplit(".", 1)[0]
         frames = _font_frames(wd, basename)
         by_char = {}
         for f in frames:
