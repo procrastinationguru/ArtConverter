@@ -21,7 +21,8 @@ the licences are mixed (system fonts may not be redistributed).
 | Zurich16/20Font | Bitstream Zurich (= Univers), condensed | ArchivoNarrow[wght].ttf at wght 700 (stand-in) | Google Fonts, OFL |
 | LatinXCN30Font | Latin Extra Condensed (caps only) | StintUltraCondensed-Regular.ttf, upper case (stand-in) | Google Fonts, OFL |
 | ClarendonBLK18Font | Clarendon Black | Coustard-Black.ttf (stand-in) | Google Fonts, OFL |
-| Flare12/14Font | Corel Flareserif 821 (= Albertus), bold | AlegreyaSans-ExtraBold.ttf (stand-in) | Google Fonts, OFL |
+| Flare12/14Font | Corel Flareserif 821 (= Albertus), bold | Grenze[wght].ttf at wght 200 (user pick, round 8) | Google Fonts, OFL |
+| LogbookFont (Flare12 copy, logbook body) | - | JimNightshade-Regular.ttf (user pick, round 8) | Google Fonts, OFL |
 | Elga12Font | unidentified heavy old-style serif | CrimsonPro[wght].ttf at wght 800 (stand-in) | Google Fonts, OFL |
 | Euph30Font | unidentified condensed Victorian serif | Grenze[wght].ttf at wght 700 (stand-in) | Google Fonts, OFL |
 | Nick16Font | unidentified, Nicolas Cochin style | LindenHill-Regular.ttf (stand-in) | Google Fonts, OFL |
