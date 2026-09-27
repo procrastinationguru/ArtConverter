@@ -34,6 +34,9 @@ LABELS = [
 # Placement-only vertical nudge in vanilla px (the box still says what to
 # erase): Cattan sat a pixel low against the other labels' spacing.
 NUDGE_Y = {"Cattan": -1}
+# Per-line size factor (baseline kept): Cattan read taller than the rest
+# in game (user, round 8).
+SIZE_SCALE = {"Cattan": 0.9}
 
 
 SUPERSAMPLE = 4
@@ -95,7 +98,7 @@ def reletter(vanilla: Image.Image, hd: Image.Image) -> Image.Image:
         xs = slice(max(0, x0 * s - pad), x1 * s + pad)
         out[ys, xs] = inpaint_colorkey(out[ys, xs], mask[ys, xs], max_iter=200)
         for text, (bx0, by0, bx1, by1) in label:
-            mask = _glyph_mask(text, size)
+            mask = _glyph_mask(text, max(8, round(size * SIZE_SCALE.get(text, 1.0))))
             h, w = mask.shape
             # never wider than the vanilla line (Thanatos ran into its
             # coast): squeeze to the box
