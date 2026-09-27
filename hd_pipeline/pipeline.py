@@ -2208,6 +2208,11 @@ FONT_TTF = {
     "art/interface/Garmond6Font.ART": ("EBGaramond.ttf", 600),
     "art/interface/Garmond8Font.ART": ("EBGaramond.ttf", 600),
     "art/interface/Garmond9Font.ART": ("EBGaramond.ttf", 600),
+    "art/interface/Icons17Font.ART": ("MORPHEUS.TTF", None),
+    "art/interface/Icons32Font.ART": ("MORPHEUS.TTF", None),
+    "art/interface/NewsIconsFont.ART": (None, None),
+    "art/interface/BookImagesFont.ART": (None, None),
+    "art/interface/rollerfont.art": ("arial.ttf", None),
     "art/interface/Georgia30Font.ART": ("georgia.ttf", None),
     "art/interface/LatinXCN30Font.ART": ("StintUltraCondensed-Regular.ttf", None),
     "art/interface/morph15font.art": ("MORPHEUS.TTF", None),
@@ -2223,6 +2228,25 @@ FONT_TTF = {
 }
 # Fonts whose vanilla lower case is drawn as capitals.
 FONT_CAPS_ONLY = {"art/interface/LatinXCN30Font.ART"}
+# Glyphs that are pictures, not letters (Icons17/32Font's digits are the
+# tech discipline icons, BookImagesFont is the book maps): ESRGAN-upscaled
+# from the vanilla coverage instead. A string lists the characters; an int
+# takes every glyph at least that wide. Fonts with no TTF (None) upscale
+# their remaining glyphs smoothly.
+FONT_PICTO = {
+    "art/interface/Icons17Font.ART": "0123456789",
+    "art/interface/Icons32Font.ART": "0123456789:",
+    "art/interface/NewsIconsFont.ART": 12,
+    "art/interface/BookImagesFont.ART": 12,
+    "art/interface/rollerfont.art": "0123456789",
+}
+
+
+def _is_picto(rel: str, ch: str | None, width: int) -> bool:
+    picto = FONT_PICTO.get(rel)
+    if isinstance(picto, int):
+        return width >= picto
+    return picto is not None and ch is not None and ch in picto
 FONT_DIR = Path(__file__).resolve().parent / "fonts" / "vanilla"
 
 
@@ -2297,20 +2321,23 @@ def cmd_hd_fonts(only: str | None = None) -> None:
             ImageDraw.Draw(img).text((4 - box[0], 4 - box[1]), ch, font=font, fill=255, anchor="ls")
             return np.asarray(img, dtype=np.float32) / 255.0, 4 - box[1]
 
-        ref_box = _ink_box(by_char["H"]["cov"])
-        cap_v = (ref_box[3] - ref_box[1]) * s * ss
-        baseline = ref_box[3]  # vanilla row just under the 'H'
-        size = int(cap_v)
-        for _ in range(3):  # cap height -> point size
-            a, _ = render(load(size), "H")
-            b = _ink_box(a, 0.5)
-            size = max(4, int(round(size * cap_v / max(1, b[3] - b[1]))))
-        font = load(size)
-        missing, _ = render(font, "\U0010FFFD")
+        font = None
+        size = 0
+        ratios = []
+        if ttf is not None:
+            ref_box = _ink_box(by_char["H"]["cov"])
+            cap_v = (ref_box[3] - ref_box[1]) * s * ss
+            baseline = ref_box[3]  # vanilla row just under the 'H'
+            size = int(cap_v)
+            for _ in range(3):  # cap height -> point size
+                a, _ = render(load(size), "H")
+                b = _ink_box(a, 0.5)
+                size = max(4, int(round(size * cap_v / max(1, b[3] - b[1]))))
+            font = load(size)
+            missing, _ = render(font, "\U0010FFFD")
 
         # Per-font x scale from the letters' ink widths.
-        ratios = []
-        for ch in "abcdeghknopqrsuvxyzABCDEGHKNOPRSUVXYZ":
+        for ch in "abcdeghknopqrsuvxyzABCDEGHKNOPRSUVXYZ" if font is not None else "":
             f = by_char.get(ch)
             vb = _ink_box(f["cov"]) if f is not None else None
             if vb is None:
@@ -2324,13 +2351,24 @@ def cmd_hd_fonts(only: str | None = None) -> None:
         out_dir = hd_out_dir(rel)
         out_dir.mkdir(parents=True, exist_ok=True)
         fallback = 0
+        picto = 0
         for f in frames:
             W, H = f["w"] * s, f["h"] * s
             cell = np.zeros((H * ss, W * ss), np.float32)
             ch = _glyph_char(f["frame"])
             vb = _ink_box(f["cov"])
             drawn = False
-            if ch is not None and vb is not None and ch.strip():
+            if vb is not None and _is_picto(rel, ch, f["w"]):
+                tmp = config.WORK_DIR / "_font_picto"
+                tmp.mkdir(parents=True, exist_ok=True)
+                Image.fromarray((f["cov"] * 255).astype(np.uint8), "L").convert("RGB").save(tmp / "in.png")
+                run_esrgan(tmp / "in.png", tmp / "out.png", config.REALESRGAN_MODEL)
+                up = Image.open(tmp / "out.png").convert("L").resize((W * ss, H * ss), Image.LANCZOS)
+                cell = np.asarray(up, dtype=np.float32) / 255.0
+                cell = np.where(cell < 0.04, 0.0, cell)
+                drawn = True
+                picto += 1
+            elif font is not None and ch is not None and vb is not None and ch.strip():
                 a, base = render(font, ch.upper() if caps else ch)
                 if a.shape != missing.shape or not np.array_equal(a, missing):
                     tb = _ink_box(a, 0.02)
@@ -2371,7 +2409,7 @@ def cmd_hd_fonts(only: str | None = None) -> None:
             rgba = Image.new("RGBA", (W, H), (255, 255, 255, 0))
             rgba.putalpha(alpha)
             rgba.save(out_dir / f"r0_f{f['frame']}.png")
-        print(f"{rel}: {len(frames)} glyphs from {ttf} at {size / ss:.1f}px x{x_scale:.2f}, {fallback} vanilla fallbacks")
+        print(f"{rel}: {len(frames)} glyphs from {ttf} at {size / ss:.1f}px x{x_scale:.2f}, {picto} pictures, {fallback} vanilla fallbacks")
 
 
 def cmd_hd_compose(only: str | None = None, model: str | None = None, dry_run: bool = False) -> None:
