@@ -2396,6 +2396,62 @@ def _fit_glyph(a: np.ndarray, base: int, vb, ch: str, x_scale: float, by: int, c
     return np.concatenate([np.asarray(q, dtype=np.float32) / 255.0 for q in parts], axis=0), x0, y0
 
 
+# PC lens ring overlays (the round view in charedit/logbook/inventory/...,
+# intgame_pc_lens_redraw()): 89x89 squares, rim + wood corners around a
+# transparent inscribed-circle hole the view shows through. The upscaled
+# 1x hole edge is a staircase (#121); replace it with an analytic,
+# anti-aliased circle. (The corners' mismatch with the panel, #110/#111, is
+# handled in the engine - intgame_pc_lens_hd_corners().)
+LENS_RINGS = ["PCWinCvr", "Char_PCC", "Lns_Bart", "Lns_Loot", "Lns_Papr", "OptionsPCLens", "SaveLoadPCLens"]
+
+
+def lens_ring_alpha(rgba: np.ndarray) -> tuple[np.ndarray, float]:
+    """New alpha for a lens ring sidecar: within a band around the hole's
+    edge (median radius of the upscaled staircase) an analytic circle with
+    a 1 px soft edge; everywhere else the original alpha. Returns (alpha
+    0..255, hole radius)."""
+    from scipy import ndimage
+    h, w = rgba.shape[:2]
+    a = rgba[..., 3].astype(np.float32) / 255.0
+    yy, xx = np.mgrid[:h, :w].astype(np.float32)
+    labels, _ = ndimage.label(a < 0.5)
+    hole = labels == labels[h // 2, w // 2]
+    cx, cy = w / 2.0, h / 2.0
+    d = np.hypot(xx + 0.5 - cx, yy + 0.5 - cy)
+    op = a >= 0.5
+    nb = np.zeros_like(op)
+    nb[1:, :] |= op[:-1, :]
+    nb[:-1, :] |= op[1:, :]
+    nb[:, 1:] |= op[:, :-1]
+    nb[:, :-1] |= op[:, 1:]
+    edge = hole & nb
+    r_in = float(np.median(d[edge])) if edge.any() else min(w, h) / 2.0
+    band = np.abs(d - r_in) < 6.0
+    alpha = np.where(band, np.clip(d - r_in + 0.5, 0, 1), np.where(hole, 0.0, a))
+    return (alpha * 255.0 + 0.5).astype(np.uint8), r_in
+
+
+def cmd_hd_lens_rings(only: str | None = None, out_root: Path | None = None) -> None:
+    """Smooth the lens ring sidecars' hole edge (see LENS_RINGS). Originals go
+    to work/_lens_originals/ once; always rebuilt from those."""
+    for name in LENS_RINGS:
+        if only is not None and only.lower() not in name.lower():
+            continue
+        rel = f"art/interface/{name}.ART"
+        out_dir = hd_out_dir(rel)
+        backup = config.WORK_DIR / "_lens_originals" / name
+        if not backup.exists():
+            shutil.copytree(out_dir, backup)
+        dest = out_dir if out_root is None else out_root / name
+        dest.mkdir(parents=True, exist_ok=True)
+        for src in sorted(backup.glob("r*_f*.png")):
+            rgba = np.asarray(Image.open(src).convert("RGBA")).copy()
+            alpha, r_in = lens_ring_alpha(rgba)
+            rgba[..., 3] = alpha
+            Image.fromarray(rgba, "RGBA").save(dest / src.name)
+            print(f"  {name}/{src.name}: hole radius {r_in:.1f} px")
+
+
 def cmd_hd_fonts(only: str | None = None, ttf_override: tuple | None = None,
                  out_root: Path | None = None) -> None:
     """Glyph sidecars for the vanilla bitmap fonts, rendered from TTFs
