@@ -2790,6 +2790,9 @@ def main() -> None:
     p_fonts = sub.add_parser("hd-fonts", help="Glyph sidecars for the vanilla bitmap fonts, rendered from fonts/vanilla/ TTFs in each glyph's own cell")
     p_fonts.add_argument("--only", default=None, help="Only fonts whose path contains this text")
 
+    p_lens = sub.add_parser("hd-lens-rings", help="Smooth the PC lens ring sidecars' hole edge (LENS_RINGS)")
+    p_lens.add_argument("--only", default=None)
+
     p_scan = sub.add_parser("hd-scan", help="Find (and with --fix redo) hd/art sidecars written from corrupt ncnn batch output")
     p_scan.add_argument("categories", nargs="+")
     p_scan.add_argument("--workers", type=int, default=8)
@@ -2870,6 +2873,9 @@ def main() -> None:
 
     if args.command == "hd-fonts":
         cmd_hd_fonts(args.only)
+        return
+    if args.command == "hd-lens-rings":
+        cmd_hd_lens_rings(args.only)
         return
         
     if args.command == "hd-scan":
