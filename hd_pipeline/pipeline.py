@@ -2157,6 +2157,36 @@ BUTTON_MODEL = {
     "Char_Plus": "remacri-4x",
     "Char_Minus": "remacri-4x",
 }
+# Round 8 remacri pass (user: remacri wins on small assets - checked in game,
+# then fixed one by one): A = small arrow / +- controls, B = small symbol
+# icons, C = cursors. See docs/ROUND8_PLAN.md.
+REMACRI_SMALL = (
+    # A
+    "SP_Plus SP_Minus Char_HTFTPlus Char_HTFTMinus OldChar_Plus OldChar_Minus "
+    "SkilAddBut SkilMinusBut SpellTech_Add SpellTech_Minus Big_Grn_L Big_Grn_R "
+    "PageTurn_L PageTurn_R Schm_LArrow Schm_RArrow WrtnBookLArro WrtnBookRArro "
+    "SldrButt_L_Arrow SldrButt_R_Arrow Sm_RightArrow Scrll_DWN Scrll_UP ScrllDWN "
+    "ScrllUP Follow_Scroll_dwn Follow_Scroll_dwn_OFF Follow_Scroll_up "
+    "Follow_Scroll_up_OFF FollowerCycleLeft FollowerCycleRight MPCycleLeftButton "
+    "MPCycleRightButton M_UpBut M_DnBut MultiPlay_UP MultiPlay_DWN Cursor_UP "
+    "Cursor_DWN BookmarkButt UnBookmarkButt PrivMes_ClsBut EndTurn_But "
+    "MPly_AddBut MPly_KickBut MPRefreshButton "
+    # B
+    "MM_Chest MM_Cross MM_Loc MM_LocNew MM_Note MM_Ques MM_Skull MM_WayP "
+    "MMB_Chest MMB_Note MMB_Ques MMB_Skull AP_Green AP_Orange AP_Red "
+    "comm_sk_small tech_sk_small SKL_Combine SKL_Conceal SKL_Heal SKL_PickLock "
+    "SKL_pickpocket SKL_Repair SKL_silentmove SKL_Traps Pen_Cover Pen_Injury "
+    "Pen_Light Pen_MSR Pen_Perception Pen_Range Ammo_Icon_Arrows "
+    "Ammo_Icon_Bullets Ammo_Icon_Charges Ammo_Icon_Fuel Ammo_Icon_Gold "
+    "Ammo_Icon_Mana BlockedShot Magic-Tech-Penalty Item_Dam XP_Pip1 XP_Pip2 "
+    "XP_Pip3 XP_Pip4 XP_Pip5 XP_Pip6 XP_Pip7 XP_Pip8 XP_Pip9 XP_Pip10 HKTshON "
+    "HKTshOFF MT_Apt "
+    # C
+    "cursor battlecur skillcur spellcur TechCur Cursor-Called-Arm "
+    "Cursor-Called-Head Cursor-Called-Leg CURSOR-Identify-Item cur_del Scroll-0 "
+    "Scroll-1 Scroll-2 Scroll-3 Scroll-4 Scroll-5 Scroll-6 Scroll-7 Scroll_not"
+).split()
+BUTTON_MODEL.update({name: "remacri-4x" for name in REMACRI_SMALL})
 
 
 def cmd_hd_buttons(names: list[str], model: str | None = None) -> None:
