@@ -31,6 +31,10 @@ LABELS = [
     [("Cattan", (125, 318, 151, 325))],
 ]
 
+# Placement-only vertical nudge in vanilla px (the box still says what to
+# erase): Cattan sat a pixel low against the other labels' spacing.
+NUDGE_Y = {"Cattan": -1}
+
 
 SUPERSAMPLE = 4
 
@@ -100,7 +104,7 @@ def reletter(vanilla: Image.Image, hd: Image.Image) -> Image.Image:
                 mask = np.asarray(Image.fromarray((mask * 255).astype(np.uint8)).resize((w, h), Image.LANCZOS), np.float32) / 255
             # on the vanilla line: left edge and baseline on its box
             gx = bx0 * s
-            gy = by1 * s - h
+            gy = by1 * s - h + NUDGE_Y.get(text, 0) * s
             a = mask[..., None]
             region = out[gy:gy + h, gx:gx + w]
             out[gy:gy + h, gx:gx + w] = region * (1 - a) + ink * a
