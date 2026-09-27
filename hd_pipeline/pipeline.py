@@ -2189,6 +2189,173 @@ def cmd_hd_buttons(names: list[str], model: str | None = None) -> None:
             print(f"  {bmp.name} -> {dest.relative_to(config.HD_OVERLAY_DIR)}")
 
 
+# Vanilla bitmap font art -> (TTF/OTF in fonts/vanilla/, variable-font weight
+# or None). See fonts/vanilla/README.md for where each came from.
+FONT_TTF = {
+    "art/interface/arial10font.art": ("arial.ttf", None),
+    "art/interface/ArialB12Font.ART": ("arialbd.ttf", None),
+    "art/interface/BookmanOldBold18Font.ART": ("texgyrebonum-bold.otf", None),
+    "art/interface/casablanca16font.art": ("IMFeENrm28P.ttf", None),
+    "art/interface/CasablancaAntique30Font.ART": ("IMFeENrm28P.ttf", None),
+    "art/interface/ClarendonBLK18Font.ART": ("Coustard-Black.ttf", None),
+    "art/interface/Cloister18Font.ART": ("CloisterBlack.ttf", None),
+    "art/interface/Comic12Font.ART": ("comic.ttf", None),
+    "art/interface/Courier10Font.ART": ("cour.ttf", None),
+    "art/interface/Elga12Font.ART": ("CrimsonPro[wght].ttf", 800),
+    "art/interface/Euph30Font.ART": ("Grenze[wght].ttf", 700),
+    "art/interface/Flare12Font.ART": ("AlegreyaSans-ExtraBold.ttf", None),
+    "art/interface/Flare14Font.ART": ("AlegreyaSans-ExtraBold.ttf", None),
+    "art/interface/Garmond6Font.ART": ("EBGaramond.ttf", 600),
+    "art/interface/Garmond8Font.ART": ("EBGaramond.ttf", 600),
+    "art/interface/Garmond9Font.ART": ("EBGaramond.ttf", 600),
+    "art/interface/Georgia30Font.ART": ("georgia.ttf", None),
+    "art/interface/LatinXCN30Font.ART": ("StintUltraCondensed-Regular.ttf", None),
+    "art/interface/morph15font.art": ("MORPHEUS.TTF", None),
+    "art/interface/Morph30Font.ART": ("MORPHEUS.TTF", None),
+    "art/morph15font.ART": ("MORPHEUS.TTF", None),
+    "art/interface/NewTimes16Font.ART": ("times.ttf", None),
+    "art/interface/Nick16Font.ART": ("LindenHill-Regular.ttf", None),
+    "art/interface/Pepper20Font.ART": ("Fondamento-Italic.ttf", None),
+    "art/interface/pork12font.art": ("IMFePIrm28P.ttf", None),
+    "art/interface/Swiss921Font.ART": ("Anton-Regular.ttf", None),
+    "art/interface/Zurich16Font.ART": ("ArchivoNarrow[wght].ttf", 700),
+    "art/interface/Zurich20Font.ART": ("ArchivoNarrow[wght].ttf", 700),
+}
+# Fonts whose vanilla lower case is drawn as capitals.
+FONT_CAPS_ONLY = {"art/interface/LatinXCN30Font.ART"}
+FONT_DIR = Path(__file__).resolve().parent / "fonts" / "vanilla"
+
+
+def _font_frames(wd: Path, basename: str) -> list[dict]:
+    """Every glyph frame of an unpacked font art: coverage (0..1, from the
+    grey palette; index 0 is the key) and size."""
+    num_frames, _ = read_ini_frame_count(wd / (basename + ".ini"))
+    frames = []
+    for _, frame, bmp in hd_frame_bmps(wd, basename, num_frames, False):
+        w, h = read_bmp_dims(bmp)
+        h = abs(h)
+        idx = np.asarray(read_bmp_indices(bmp), dtype=np.uint8).reshape(h, w)
+        pal = np.asarray(read_bmp_palette(bmp), dtype=np.uint8).reshape(256, 3)
+        cov = np.where(idx == 0, 0.0, pal[idx].max(axis=2) / 255.0)
+        frames.append(dict(frame=frame, w=w, h=h, cov=cov))
+    return frames
+
+
+def _ink_box(a: np.ndarray, thresh: float = 0.25):
+    ys, xs = np.nonzero(a > thresh)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _glyph_char(frame: int) -> str | None:
+    # tig_font: frame = byte - 31, text is Windows-1252.
+    try:
+        return bytes([frame + 31]).decode("cp1252")
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def cmd_hd_fonts(only: str | None = None) -> None:
+    """Glyph sidecars for the vanilla bitmap fonts, rendered from TTFs
+    (FONT_TTF) instead of upscaled: white with the coverage as alpha (the
+    engine tints them with the font colour, like the vanilla ALPHA_SRC +
+    COLOR_CONST glyph blit). Each keeps its vanilla frame's cell exactly
+    (4x size, same baseline, ink centred where the vanilla ink was), so text
+    layout - advances, wrapping, centring - is unchanged. Size: the TTF's
+    cap height matches the vanilla 'H'; a per-font x scale matches the
+    vanilla letter widths; a glyph still too wide for its cell is squeezed.
+    Glyphs the TTF lacks fall back to a smooth upscale of the vanilla
+    coverage."""
+    from PIL import ImageDraw, ImageFont
+
+    s = HD_SCALE
+    ss = 4  # supersampling of the TTF render
+    for rel, (ttf, weight) in FONT_TTF.items():
+        if only is not None and only.lower() not in rel.lower():
+            continue
+        wd = cmd_unpack(rel, quiet=True)
+        basename = Path(rel).name.rsplit(".", 1)[0]
+        frames = _font_frames(wd, basename)
+        by_char = {}
+        for f in frames:
+            ch = _glyph_char(f["frame"])
+            if ch is not None:
+                by_char[ch] = f
+        caps = rel in FONT_CAPS_ONLY
+
+        def load(size: int):
+            font = ImageFont.truetype(str(FONT_DIR / ttf), size)
+            if weight is not None:
+                font.set_variation_by_axes([weight])
+            return font
+
+        def render(font, ch: str):
+            """(coverage, baseline row) with the glyph's ink box tight."""
+            box = font.getbbox(ch, anchor="ls")
+            img = Image.new("L", (max(1, box[2] - box[0] + 8), max(1, box[3] - box[1] + 8)), 0)
+            ImageDraw.Draw(img).text((4 - box[0], 4 - box[1]), ch, font=font, fill=255, anchor="ls")
+            return np.asarray(img, dtype=np.float32) / 255.0, 4 - box[1]
+
+        ref_box = _ink_box(by_char["H"]["cov"])
+        cap_v = (ref_box[3] - ref_box[1]) * s * ss
+        baseline = ref_box[3]  # vanilla row just under the 'H'
+        size = int(cap_v)
+        for _ in range(3):  # cap height -> point size
+            a, _ = render(load(size), "H")
+            b = _ink_box(a, 0.5)
+            size = max(4, int(round(size * cap_v / max(1, b[3] - b[1]))))
+        font = load(size)
+        missing, _ = render(font, "\U0010FFFD")
+
+        # Per-font x scale from the letters' ink widths.
+        ratios = []
+        for ch in "abcdeghknopqrsuvxyzABCDEGHKNOPRSUVXYZ":
+            f = by_char.get(ch)
+            vb = _ink_box(f["cov"]) if f is not None else None
+            if vb is None:
+                continue
+            a, _ = render(font, ch.upper() if caps else ch)
+            tb = _ink_box(a, 0.5)
+            if tb is not None and tb[2] > tb[0]:
+                ratios.append((vb[2] - vb[0]) * s * ss / (tb[2] - tb[0]))
+        x_scale = float(np.clip(np.median(ratios), 0.6, 1.15)) if ratios else 1.0
+
+        out_dir = hd_out_dir(rel)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fallback = 0
+        for f in frames:
+            W, H = f["w"] * s, f["h"] * s
+            cell = np.zeros((H * ss, W * ss), np.float32)
+            ch = _glyph_char(f["frame"])
+            vb = _ink_box(f["cov"])
+            drawn = False
+            if ch is not None and vb is not None and ch.strip():
+                a, base = render(font, ch.upper() if caps else ch)
+                if a.shape != missing.shape or not np.array_equal(a, missing):
+                    tb = _ink_box(a, 0.02)
+                    if tb is not None:
+                        g = Image.fromarray((a[tb[1]:tb[3], tb[0]:tb[2]] * 255).astype(np.uint8), "L")
+                        gw = min(W * ss, max(1, int(round(g.width * x_scale))))
+                        g = np.asarray(g.resize((gw, g.height), Image.LANCZOS), dtype=np.float32) / 255.0
+                        x0 = int(round((vb[0] + vb[2]) / 2 * s * ss - gw / 2))
+                        x0 = min(max(x0, 0), W * ss - gw)
+                        y0 = baseline * s * ss - (base - tb[1])
+                        ys0, ys1 = max(0, y0), min(H * ss, y0 + g.shape[0])
+                        if ys1 > ys0:
+                            cell[ys0:ys1, x0:x0 + gw] = g[ys0 - y0:ys1 - y0]
+                            drawn = True
+            if not drawn and vb is not None:
+                up = Image.fromarray((f["cov"] * 255).astype(np.uint8), "L").resize((W * ss, H * ss), Image.LANCZOS)
+                cell = np.asarray(up, dtype=np.float32) / 255.0
+                fallback += 1
+            alpha = Image.fromarray((np.clip(cell, 0, 1) * 255).astype(np.uint8), "L").resize((W, H), Image.BOX)
+            rgba = Image.new("RGBA", (W, H), (255, 255, 255, 0))
+            rgba.putalpha(alpha)
+            rgba.save(out_dir / f"r0_f{f['frame']}.png")
+        print(f"{rel}: {len(frames)} glyphs from {ttf} at {size / ss:.1f}px x{x_scale:.2f}, {fallback} vanilla fallbacks")
+
+
 def cmd_hd_compose(only: str | None = None, model: str | None = None, dry_run: bool = False) -> None:
     """Rebuild every captured interface frame's sidecar from an in-context
     upscale (see the block comment above). The first run keeps each frame's
@@ -2389,6 +2556,9 @@ def main() -> None:
     p_buttons.add_argument("names", nargs="+", help="interface art names (Skills_Button) or rel paths")
     p_buttons.add_argument("--model", default=None)
 
+    p_fonts = sub.add_parser("hd-fonts", help="Glyph sidecars for the vanilla bitmap fonts, rendered from fonts/vanilla/ TTFs in each glyph's own cell")
+    p_fonts.add_argument("--only", default=None, help="Only fonts whose path contains this text")
+
     p_scan = sub.add_parser("hd-scan", help="Find (and with --fix redo) hd/art sidecars written from corrupt ncnn batch output")
     p_scan.add_argument("categories", nargs="+")
     p_scan.add_argument("--workers", type=int, default=8)
@@ -2466,6 +2636,11 @@ def main() -> None:
     if args.command == "hd-buttons":
         cmd_hd_buttons(args.names, model=args.model)
         return
+
+    if args.command == "hd-fonts":
+        cmd_hd_fonts(args.only)
+        return
+        
     if args.command == "hd-scan":
         cmd_hd_scan(args.categories, workers=args.workers, fix=args.fix, model=args.model)
         return
