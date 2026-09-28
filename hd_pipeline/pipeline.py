@@ -2516,6 +2516,56 @@ LENS_RINGS = {
 }
 
 
+def _fit_circle(ex: np.ndarray, ey: np.ndarray) -> tuple[float, float]:
+    """Algebraic circle fit (x^2 + y^2 + D x + E y + F = 0) -> centre."""
+    m = np.stack([ex, ey, np.ones_like(ex)], 1)
+    sol, *_ = np.linalg.lstsq(m, -(ex * ex + ey * ey), rcond=None)
+    return float(-sol[0] / 2.0), float(-sol[1] / 2.0)
+
+
+# Outer silhouettes with a dark, bumpy 1x outline that upscaled into a
+# serrated edge (#185 world map nav bar): the edge facing the outside is
+# pulled in by `erode` HD px and re-smoothed (Gaussian `sigma` + smoothstep);
+# a round lens hole (LENS_RINGS) is left as it is. name -> (erode, sigma).
+OUTER_SMOOTH = {"Nav_Cvr": (5.0, 4.5)}
+
+
+def cmd_hd_outer_smooth(only: str | None = None) -> None:
+    from scipy import ndimage
+    for name, (erode, sigma) in OUTER_SMOOTH.items():
+        if only is not None and only.lower() not in name.lower():
+            continue
+        out_dir = hd_out_dir(f"art/interface/{name}.ART")
+        backup = config.WORK_DIR / "_outer_originals" / name
+        if not backup.exists():
+            shutil.copytree(out_dir, backup)
+        for src in sorted(backup.glob("*.png")):
+            im = np.asarray(Image.open(src).convert("RGBA")).astype(np.float32)
+            h, w = im.shape[:2]
+            a = im[..., 3] / 255.0
+            yy, xx = np.mgrid[:h, :w].astype(np.float32)
+            labels, _ = ndimage.label(a < 0.5)
+            border = set(np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))) - {0}
+            outside = np.isin(labels, list(border))
+            keep = np.zeros_like(outside)
+            if name in LENS_RINGS:  # the hole: everything near its circle stays
+                hole = labels == labels[h // 2, w // 2]
+                op = a >= 0.5
+                nb = ndimage.binary_dilation(op) & hole
+                if nb.sum() >= 16:
+                    cx, cy = _fit_circle(xx[nb] + 0.5, yy[nb] + 0.5)
+                    r = float(np.percentile(np.hypot(xx[nb] + 0.5 - cx, yy[nb] + 0.5 - cy), 97))
+                    keep = np.hypot(xx + 0.5 - cx, yy + 0.5 - cy) < r + 12
+                    outside &= ~keep
+            d = ndimage.distance_transform_edt(~outside)
+            t = np.clip((gaussian_blur_2d(np.minimum(a, np.clip(d - erode, 0, 1)), sigma) - 0.3) / 0.4, 0, 1)
+            na = t * t * (3 - 2 * t)
+            near = (d < erode + 4 * sigma) & ~keep
+            im[..., 3] = np.where(near, na, a) * 255.0
+            Image.fromarray(np.clip(im + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / src.name)
+            print(f"{name}/{src.name}: outer edge smoothed")
+
+
 def lens_ring_alpha(rgba: np.ndarray, pct: float = 50) -> tuple[np.ndarray, float]:
     """New alpha for a ring sidecar with a round transparent hole (the
     component under the image centre): the circle is least-squares fitted
@@ -2537,11 +2587,7 @@ def lens_ring_alpha(rgba: np.ndarray, pct: float = 50) -> tuple[np.ndarray, floa
     edge = hole & nb
     if edge.sum() < 16:
         return rgba[..., 3].copy(), 0.0
-    ex, ey = xx[edge] + 0.5, yy[edge] + 0.5
-    # algebraic circle fit: x^2 + y^2 + D x + E y + F = 0
-    m = np.stack([ex, ey, np.ones_like(ex)], 1)
-    sol, *_ = np.linalg.lstsq(m, -(ex * ex + ey * ey), rcond=None)
-    cx, cy = -sol[0] / 2.0, -sol[1] / 2.0
+    cx, cy = _fit_circle(xx[edge] + 0.5, yy[edge] + 0.5)
     d = np.hypot(xx + 0.5 - cx, yy + 0.5 - cy)
     r_in = float(np.percentile(d[edge], pct))
     band = np.abs(d - r_in) < 6.0
@@ -3027,6 +3073,8 @@ def main() -> None:
     p_fonts = sub.add_parser("hd-fonts", help="Glyph sidecars for the vanilla bitmap fonts, rendered from fonts/vanilla/ TTFs in each glyph's own cell")
     p_fonts.add_argument("--only", default=None, help="Only fonts whose path contains this text")
 
+    p_outer = sub.add_parser("hd-outer-smooth", help="Smooth serrated outer silhouettes (OUTER_SMOOTH)")
+    p_outer.add_argument("--only", default=None)
     p_frame = sub.add_parser("hd-frame-smooth", help="Round off wobbly gold panel frames (FRAME_SMOOTH)")
     p_frame.add_argument("--only", default=None)
     p_cvr = sub.add_parser("hd-cvr-mask", help="Paperdoll slot silhouettes: keep only the silhouette (CVR_SLOTS)")
@@ -3119,6 +3167,9 @@ def main() -> None:
         return
     if args.command == "hd-lens-rings":
         cmd_hd_lens_rings(args.only)
+        return
+    if args.command == "hd-outer-smooth":
+        cmd_hd_outer_smooth(args.only)
         return
     if args.command == "hd-frame-smooth":
         cmd_hd_frame_smooth(args.only)
