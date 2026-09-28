@@ -2624,6 +2624,69 @@ def cmd_hd_disc_mask(only: str | None = None) -> None:
         print(f"{name}: disc mask r={r} at ({cx}, {cy})")
 
 
+# Near-black panel boxes turned pure black (#202: the HUD money/ammo box
+# is (0,8,8) teal-black in IntBotom and (2,2,2) behind the ammo icons, next
+# to the counter's (0,0,0) fill - read as a grey patch). BLACK_BOXES: 1x
+# seed points; the connected region of exactly the seed's vanilla colour is
+# blackened in the sidecar (dark HD pixels only, 1 HD px feather).
+# BLACK_BG: arts whose dark border-connected background goes to 0.
+BLACK_BOXES = {"IntBotom": [(100, 80)]}
+BLACK_BG = ["Ammo_Icon_Arrows", "Ammo_Icon_Bullets", "Ammo_Icon_Charges",
+            "Ammo_Icon_Fuel", "Ammo_Icon_Gold", "Ammo_Icon_Mana"]
+
+
+def cmd_hd_black_fill(only: str | None = None) -> None:
+    from PIL import ImageFilter
+    from scipy import ndimage
+
+    def feather(m, w, h):
+        img = Image.fromarray((m * 255).astype(np.uint8), "L")
+        if img.size != (w, h):
+            img = img.resize((w, h), Image.NEAREST)
+        return np.asarray(img.filter(ImageFilter.GaussianBlur(0.7)), dtype=np.float32) / 255.0
+
+    for name, seeds in BLACK_BOXES.items():
+        if only is not None and only.lower() not in name.lower():
+            continue
+        rel = f"art/interface/{name}.ART"
+        wd = cmd_unpack(rel, quiet=True)
+        out_dir = hd_out_dir(rel)
+        backup = config.WORK_DIR / "_black_originals" / name
+        if not backup.exists():
+            shutil.copytree(out_dir, backup)
+        c = np.asarray(Image.open(sorted(wd.glob("*.bmp"))[0]).convert("RGB")).astype(np.int32)
+        region = np.zeros(c.shape[:2], bool)
+        for x, y in seeds:
+            same = (c == c[y, x]).all(axis=2)
+            lab, _ = ndimage.label(same)
+            region |= lab == lab[y, x]
+        src = backup / "r0_f0.png"
+        a = np.asarray(Image.open(src).convert("RGBA")).astype(np.float32)
+        m = feather(region, a.shape[1], a.shape[0])
+        m *= a[..., :3].max(axis=2) <= 40
+        a[..., :3] *= (1.0 - m)[..., None]
+        Image.fromarray(np.clip(a + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / src.name)
+        print(f"{name}: {int(region.sum())} 1x px -> black")
+
+    for name in BLACK_BG:
+        if only is not None and only.lower() not in name.lower():
+            continue
+        out_dir = hd_out_dir(f"art/interface/{name}.ART")
+        backup = config.WORK_DIR / "_black_originals" / name
+        if not backup.exists():
+            shutil.copytree(out_dir, backup)
+        for src in sorted(backup.glob("*.png")):
+            a = np.asarray(Image.open(src).convert("RGBA")).astype(np.float32)
+            dark = a[..., :3].max(axis=2) <= 12
+            lab, _ = ndimage.label(dark)
+            edge = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))) - {0}
+            bg = np.isin(lab, list(edge))
+            m = feather(bg, a.shape[1], a.shape[0]) * (a[..., :3].max(axis=2) <= 40)
+            a[..., :3] *= (1.0 - m)[..., None]
+            Image.fromarray(np.clip(a + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / src.name)
+        print(f"{name}: background -> black")
+
+
 # Inventory paperdoll slot silhouettes (inven_ui.c item_ui_item_silhouette_nums,
 # blitted at inven_ui_inventory_paperdoll_inv_slot_rects over PDoll): opaque
 # rects carrying their own copy of the slot grid, a few levels off PDoll's.
@@ -3081,6 +3144,8 @@ def main() -> None:
     p_cvr.add_argument("--only", default=None)
     p_disc = sub.add_parser("hd-disc-mask", help="Cut round buttons' sidecars to their disc (DISC_MASKS)")
     p_disc.add_argument("--only", default=None)
+    p_black = sub.add_parser("hd-black-fill", help="Near-black panel boxes / icon backgrounds -> pure black (BLACK_BOXES, BLACK_BG)")
+    p_black.add_argument("--only", default=None)
     p_lens = sub.add_parser("hd-lens-rings", help="Smooth the PC lens ring sidecars' hole edge (LENS_RINGS)")
     p_lens.add_argument("--only", default=None)
 
@@ -3179,6 +3244,9 @@ def main() -> None:
         return
     if args.command == "hd-disc-mask":
         cmd_hd_disc_mask(args.only)
+        return
+    if args.command == "hd-black-fill":
+        cmd_hd_black_fill(args.only)
         return
         
     if args.command == "hd-scan":
