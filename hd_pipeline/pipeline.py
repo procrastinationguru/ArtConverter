@@ -2902,6 +2902,93 @@ def cmd_hd_frame_smooth(only: str | None = None, size: int = 5) -> None:
             print(f"{name}/{src.name}: frame smoothed ({gold.mean():.1%} gold)")
 
 
+# Lens rings over a panel whose HD sidecar is a hole / black under the lens
+# (#221-#223): the ring's own corner wood (outside the gold, r > ~49.5 1x
+# px) never matched the panel - not even at 1x - so the lens showed as a
+# square. Rebuild the corners from the panel's HD wood, mirrored across the
+# square's nearest edge (continuous at the edge; the two mirrors blend
+# along the diagonal). name -> (panel art, lens x, y in the panel). Charedit
+# (Char_PCC) restores its panel in the engine instead. PCWinCvr serves the
+# logbook and the town map (MapMain, same wood there).
+# The panels' hole edge also fades 1-2 HD px outside the square (a thin dark
+# line around the lens): that band is made opaque with the wood just beyond
+# it, in every listed panel. name -> ([panels, first = wood source], x, y).
+LENS_CORNERS = {
+    "PCWinCvr": (["LogBooks_Side", "MapMain"], 25, 24),
+    "Lns_Papr": (["PDoll"], 11, 9),
+}
+LENS_CORNER_R = 49.5  # 1x px: the gold ring's outer edge
+LENS_EDGE_BAND = 3  # HD px outside the square rebuilt in the panels
+
+
+def _lens_panel_edge(panel: str, lx: int, ly: int, n: int) -> None:
+    """See LENS_EDGE_BAND. Rebuilt from a backup every run."""
+    out_dir = hd_out_dir(f"art/interface/{panel}.ART")
+    backup = config.WORK_DIR / "_lens_corner_originals" / panel
+    if not backup.exists():
+        shutil.copytree(out_dir, backup)
+    a = np.asarray(Image.open(backup / "r0_f0.png").convert("RGBA")).copy()
+    ph, pw = a.shape[:2]
+    X0, Y0, X1, Y1 = lx * HD_SCALE, ly * HD_SCALE, lx * HD_SCALE + n, ly * HD_SCALE + n
+    g = LENS_EDGE_BAND
+    for k in range(1, g + 1):
+        if X0 - k >= 0 and X0 - g - 1 >= 0:
+            a[Y0:Y1, X0 - k] = a[Y0:Y1, X0 - g - 1]
+        if X1 - 1 + k < pw and X1 + g < pw:
+            a[Y0:Y1, X1 - 1 + k] = a[Y0:Y1, X1 + g]
+        if Y0 - k >= 0 and Y0 - g - 1 >= 0:
+            a[Y0 - k, X0 - g:X1 + g] = a[Y0 - g - 1, X0 - g:X1 + g]
+        if Y1 - 1 + k < ph and Y1 + g < ph:
+            a[Y1 - 1 + k, X0 - g:X1 + g] = a[Y1 + g, X0 - g:X1 + g]
+    Image.fromarray(a, "RGBA").save(out_dir / "r0_f0.png")
+
+
+def cmd_hd_lens_corners(only: str | None = None) -> None:
+    S = HD_SCALE
+    for name, (panels, lx, ly) in LENS_CORNERS.items():
+        if only is not None and only.lower() not in name.lower():
+            continue
+        out_dir = hd_out_dir(f"art/interface/{name}.ART")
+        backup = config.WORK_DIR / "_lens_corner_originals" / name
+        if not backup.exists():
+            shutil.copytree(out_dir, backup)
+        n = Image.open(backup / "r0_f0.png").width
+        for p in panels:
+            _lens_panel_edge(p, lx, ly, n)
+        panel = panels[0]
+        pan = np.asarray(Image.open(hd_out_dir(f"art/interface/{panel}.ART") / "r0_f0.png").convert("RGB"), dtype=np.float32)
+        ph, pw = pan.shape[:2]
+        for src in sorted(backup.glob("r*_f*.png")):
+            ring = np.asarray(Image.open(src).convert("RGBA"), dtype=np.float32).copy()
+            n = ring.shape[0]
+            X0, Y0 = lx * S, ly * S
+            yy, xx = np.mgrid[:n, :n].astype(np.float32)
+            # distances to the four edges (HD px, pixel centres)
+            d = {"l": xx + 0.5, "r": n - xx - 0.5, "t": yy + 0.5, "b": n - yy - 0.5}
+            # mirror sample coordinates in the panel for each edge
+            samples = {
+                "l": (Y0 + yy, X0 - 1 - xx),
+                "r": (Y0 + yy, X0 + n + (n - 1 - xx)),
+                "t": (Y0 - 1 - yy, X0 + xx),
+                "b": (Y0 + n + (n - 1 - yy), X0 + xx),
+            }
+            acc = np.zeros((n, n, 3), np.float32)
+            wsum = np.zeros((n, n), np.float32)
+            for k, (sy, sx) in samples.items():
+                ok = (sy >= 0) & (sy < ph) & (sx >= 0) & (sx < pw)
+                w = np.exp(-d[k] / (2.0 * S)) * ok
+                col = pan[np.clip(sy, 0, ph - 1).astype(int), np.clip(sx, 0, pw - 1).astype(int)]
+                acc += col * w[..., None]
+                wsum += w
+            fill = acc / np.maximum(wsum, 1e-6)[..., None]
+            r = np.hypot(xx + 0.5 - n / 2, yy + 0.5 - n / 2)
+            m = np.clip((r - LENS_CORNER_R * S) / 3.0 + 0.5, 0, 1) * (wsum > 0)
+            ring[..., :3] = ring[..., :3] * (1 - m[..., None]) + fill * m[..., None]
+            ring[..., 3] = np.maximum(ring[..., 3], m * 255)
+            Image.fromarray(np.clip(ring + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / src.name)
+            print(f"{name}/{src.name}: corners from {panel} ({int((m > 0.5).sum())} HD px)")
+
+
 def cmd_hd_lens_rings(only: str | None = None, out_root: Path | None = None) -> None:
     """Smooth the lens ring sidecars' hole edge (see LENS_RINGS). Originals go
     to work/_lens_originals/ once; always rebuilt from those."""
@@ -3297,6 +3384,8 @@ def main() -> None:
     p_icon.add_argument("--only", default=None)
     p_black = sub.add_parser("hd-black-fill", help="Near-black panel boxes / icon backgrounds -> pure black (BLACK_BOXES, BLACK_BG)")
     p_black.add_argument("--only", default=None)
+    p_lcorn = sub.add_parser("hd-lens-corners", help="Lens ring corners from the panel's HD wood (LENS_CORNERS); run after hd-lens-rings")
+    p_lcorn.add_argument("--only", default=None)
     p_lens = sub.add_parser("hd-lens-rings", help="Smooth the PC lens ring sidecars' hole edge (LENS_RINGS)")
     p_lens.add_argument("--only", default=None)
 
@@ -3380,6 +3469,9 @@ def main() -> None:
 
     if args.command == "hd-fonts":
         cmd_hd_fonts(args.only)
+        return
+    if args.command == "hd-lens-corners":
+        cmd_hd_lens_corners(args.only)
         return
     if args.command == "hd-lens-rings":
         cmd_hd_lens_rings(args.only)
