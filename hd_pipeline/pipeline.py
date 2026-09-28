@@ -2445,8 +2445,20 @@ FONT_TTF = {
 }
 FONT_TTF.update({rel: MAIN_FONT[:2] for rel in MAIN_FONT_ARTS})
 # Fonts fitted uniformly (see _fit_glyph `uniform`): one x scale and the
-# shared baseline for every letter.
-FONT_UNIFORM: set[str] = set(MAIN_FONT_ARTS)
+# shared baseline for every letter. CasablancaAntique30Font/SchemDescFont
+# (round 8 pass 10 #14/#28/#44/#60): per-glyph fitting was re-squeezing
+# individual letters back toward the (narrow) alias source's own ink width
+# even with FONT_XSCALE=1.0 overriding the font-wide measurement - uniform
+# mode skips that per-glyph override entirely.
+FONT_UNIFORM: set[str] = set(MAIN_FONT_ARTS) | {
+    "art/interface/CasablancaAntique30Font.ART",
+    "art/interface/SchemDescFont.ART",
+    # CharStatsFont's alias source (morph15font.art) is a decorative
+    # blackletter face with irregular per-glyph ink boxes/baselines -
+    # per-glyph fitting Outfit's plain letterforms against that produced
+    # jumping baselines and overlapping letters (round 8 pass 10 #54).
+    "art/interface/CharStatsFont.ART",
+}
 
 
 def ensure_font(ttf: str) -> Path:
@@ -2498,7 +2510,16 @@ FONT_ALIAS = {
 FONT_THIN: dict[str, float] = {"art/interface/LogbookFont.ART": -0.5}
 # Cap height as a fraction of the vanilla 'H' (fonts with tall loops that
 # would not fit the vanilla cells otherwise).
-FONT_CAP: dict[str, float] = {}
+FONT_CAP: dict[str, float] = {
+    # Special Elite is wider per unit cap height than its alias sources'
+    # (Flare12Font/CasablancaAntique30Font) vanilla cells - _fit_glyph hard
+    # clips a glyph's rendered width to the cell (gw = min(cw, ...)), so
+    # even at x_scale 1.0 + uniform fit, letters were still getting clipped
+    # back down. Shrinking the point size (not the cell) is what actually
+    # avoids that clip - "changing only font size" (round 8 pass 10 #60).
+    "art/interface/CasablancaAntique30Font.ART": 0.8,
+    "art/interface/SchemDescFont.ART": 0.8,
+}
 # Glyph size after the fit, about each glyph's ink centre and the baseline
 # (layout unchanged): "2 pt smaller" Grenze (user, round 8: 12 -> 10, 14 -> 12).
 FONT_SCALE: dict[str, float] = {
