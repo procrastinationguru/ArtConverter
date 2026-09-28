@@ -2687,6 +2687,71 @@ def cmd_hd_black_fill(only: str | None = None) -> None:
         print(f"{name}: background -> black")
 
 
+# Icons painted into a panel, re-upscaled with another model and pasted
+# into the panel's sidecar (#204: Inventor's ammo icons with remacri). name
+# -> (model, 1x context crop x, y, w, h, [icon rects x, y, w, h in 1x panel
+# coordinates]). Only the icons are taken (feathered rect); the patch is
+# tone-matched to the current sidecar on a ring of wood around each icon.
+# The current sidecar (after hd-frame-smooth) is backed up once to
+# work/_icon_originals/ and always used as the base.
+ICON_PATCHES = {
+    "Inventor": ("remacri-4x", (310, 44, 108, 199), [
+        (338, 68, 26, 18),   # gold
+        (335, 90, 30, 20),   # arrows
+        (337, 114, 28, 20),  # bullets
+        (343, 138, 13, 20),  # fuel
+        (341, 162, 19, 20),  # mana (kettle)
+    ]),
+}
+
+
+def cmd_hd_icon_patch(only: str | None = None) -> None:
+    from scipy import ndimage
+    stage = config.WORK_DIR / "_icon_patch"
+    stage.mkdir(parents=True, exist_ok=True)
+    for name, (model, (cx, cy, cw, ch), rects) in ICON_PATCHES.items():
+        if only is not None and only.lower() not in name.lower():
+            continue
+        rel = f"art/interface/{name}.ART"
+        wd = cmd_unpack(rel, quiet=True)
+        out_dir = hd_out_dir(rel)
+        backup = config.WORK_DIR / "_icon_originals" / name
+        if not backup.exists():
+            shutil.copytree(out_dir, backup)
+        van = np.asarray(Image.open(sorted(wd.glob("*.bmp"))[0]).convert("RGB"), dtype=np.uint8)
+        src = van[cy:cy + ch, cx:cx + cw]
+        src_png = stage / f"{name}.png"
+        hd_png = stage / f"{name}_{model}.png"
+        Image.fromarray(src, "RGB").save(src_png)
+        run_esrgan(src_png, hd_png, model)
+        up = load_and_validate(hd_png, (cw * HD_SCALE, ch * HD_SCALE), "hd-icon-patch")
+        corr = structural_corr(src, np.asarray(up.convert("RGB").resize((cw, ch), Image.BOX)), np.ones(src.shape[:2], bool))
+        if corr < BATCH_OUTPUT_MIN_CORR:
+            raise RuntimeError(f"{model} output doesn't match {name} crop (corr {corr:.2f})")
+        up = np.asarray(up.convert("RGB"), dtype=np.float32)
+        base_img = Image.open(backup / "r0_f0.png").convert("RGBA")
+        base = np.asarray(base_img, dtype=np.float32).copy()
+        S = HD_SCALE
+        for x, y, w, h in rects:
+            pad = 4
+            X0, Y0 = (x - pad) * S, (y - pad) * S
+            W, H = (w + 2 * pad) * S, (h + 2 * pad) * S
+            cur = base[Y0:Y0 + H, X0:X0 + W, :3]
+            new = up[(y - pad - cy) * S:(y - pad - cy) * S + H, (x - pad - cx) * S:(x - pad - cx) * S + W].copy()
+            inner = np.zeros((H, W), bool)
+            inner[pad * S:(pad + h) * S, pad * S:(pad + w) * S] = True
+            ring = ~inner
+            for c in range(3):
+                mc, sc = cur[..., c][ring].mean(), cur[..., c][ring].std() + 1e-3
+                mn, sn = new[..., c][ring].mean(), new[..., c][ring].std() + 1e-3
+                new[..., c] = (new[..., c] - mn) * min(sc / sn, 1.0) + mc
+            m = ndimage.gaussian_filter(inner.astype(np.float32), 1.5 * S)
+            m = np.clip((m - 0.25) / 0.5, 0, 1)
+            base[Y0:Y0 + H, X0:X0 + W, :3] = cur * (1 - m[..., None]) + new * m[..., None]
+        Image.fromarray(np.clip(base + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / "r0_f0.png")
+        print(f"{name}: {len(rects)} icon(s) from {model}")
+
+
 # Inventory paperdoll slot silhouettes (inven_ui.c item_ui_item_silhouette_nums,
 # blitted at inven_ui_inventory_paperdoll_inv_slot_rects over PDoll): opaque
 # rects carrying their own copy of the slot grid, a few levels off PDoll's.
@@ -3144,6 +3209,8 @@ def main() -> None:
     p_cvr.add_argument("--only", default=None)
     p_disc = sub.add_parser("hd-disc-mask", help="Cut round buttons' sidecars to their disc (DISC_MASKS)")
     p_disc.add_argument("--only", default=None)
+    p_icon = sub.add_parser("hd-icon-patch", help="Re-upscale icons painted into panels with another model (ICON_PATCHES)")
+    p_icon.add_argument("--only", default=None)
     p_black = sub.add_parser("hd-black-fill", help="Near-black panel boxes / icon backgrounds -> pure black (BLACK_BOXES, BLACK_BG)")
     p_black.add_argument("--only", default=None)
     p_lens = sub.add_parser("hd-lens-rings", help="Smooth the PC lens ring sidecars' hole edge (LENS_RINGS)")
@@ -3244,6 +3311,9 @@ def main() -> None:
         return
     if args.command == "hd-disc-mask":
         cmd_hd_disc_mask(args.only)
+        return
+    if args.command == "hd-icon-patch":
+        cmd_hd_icon_patch(args.only)
         return
     if args.command == "hd-black-fill":
         cmd_hd_black_fill(args.only)
