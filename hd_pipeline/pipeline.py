@@ -2628,6 +2628,34 @@ def cmd_hd_cvr_mask(only: str | None = None) -> None:
             print(f"{name} f{frame}: silhouette {sil.mean():.0%} of the slot")
 
 
+# Gold panel frames that came out wobbly / stair-stepped (#191): a 5 px
+# median (rounds the contours) + slight blur, only near the gold, feathered.
+FRAME_SMOOTH = ["PDoll", "Inventor"]
+
+
+def cmd_hd_frame_smooth(only: str | None = None, size: int = 5) -> None:
+    from scipy import ndimage
+    for name in FRAME_SMOOTH:
+        if only is not None and only.lower() not in name.lower():
+            continue
+        out_dir = hd_out_dir(f"art/interface/{name}.ART")
+        backup = config.WORK_DIR / "_frame_originals" / name
+        if not backup.exists():
+            shutil.copytree(out_dir, backup)
+        for src in sorted(backup.glob("*.png")):
+            a = np.asarray(Image.open(src).convert("RGBA")).astype(np.float32)
+            rgb = a[..., :3]
+            r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+            gold = ndimage.binary_opening((r - b > 60) & (r > 100) & (g > 50), iterations=1)
+            zone = ndimage.binary_dilation(gold, iterations=6)
+            w = ndimage.gaussian_filter(zone.astype(np.float32), 2.0)[..., None]
+            med = np.stack([ndimage.median_filter(rgb[..., c], size=size) for c in range(3)], -1)
+            med = ndimage.gaussian_filter(med, (0.7, 0.7, 0))
+            a[..., :3] = w * med + (1 - w) * rgb
+            Image.fromarray(np.clip(a + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / src.name)
+            print(f"{name}/{src.name}: frame smoothed ({gold.mean():.1%} gold)")
+
+
 def cmd_hd_lens_rings(only: str | None = None, out_root: Path | None = None) -> None:
     """Smooth the lens ring sidecars' hole edge (see LENS_RINGS). Originals go
     to work/_lens_originals/ once; always rebuilt from those."""
@@ -2996,6 +3024,8 @@ def main() -> None:
     p_fonts = sub.add_parser("hd-fonts", help="Glyph sidecars for the vanilla bitmap fonts, rendered from fonts/vanilla/ TTFs in each glyph's own cell")
     p_fonts.add_argument("--only", default=None, help="Only fonts whose path contains this text")
 
+    p_frame = sub.add_parser("hd-frame-smooth", help="Round off wobbly gold panel frames (FRAME_SMOOTH)")
+    p_frame.add_argument("--only", default=None)
     p_cvr = sub.add_parser("hd-cvr-mask", help="Paperdoll slot silhouettes: keep only the silhouette (CVR_SLOTS)")
     p_cvr.add_argument("--only", default=None)
     p_disc = sub.add_parser("hd-disc-mask", help="Cut round buttons' sidecars to their disc (DISC_MASKS)")
@@ -3086,6 +3116,9 @@ def main() -> None:
         return
     if args.command == "hd-lens-rings":
         cmd_hd_lens_rings(args.only)
+        return
+    if args.command == "hd-frame-smooth":
+        cmd_hd_frame_smooth(args.only)
         return
     if args.command == "hd-cvr-mask":
         cmd_hd_cvr_mask(args.only)
