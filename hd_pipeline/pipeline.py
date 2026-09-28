@@ -2528,6 +2528,8 @@ def _fit_circle(ex: np.ndarray, ey: np.ndarray) -> tuple[float, float]:
 # pulled in by `erode` HD px and re-smoothed (Gaussian `sigma` + smoothstep);
 # a round lens hole (LENS_RINGS) is left as it is. name -> (erode, sigma).
 OUTER_SMOOTH = {"Nav_Cvr": (5.0, 4.5)}
+# name -> (first, last+1 HD row) where the ring stands alone above the bar.
+OUTER_RING_CUT = {"Nav_Cvr": (14, 40)}
 
 
 def cmd_hd_outer_smooth(only: str | None = None) -> None:
@@ -2562,6 +2564,23 @@ def cmd_hd_outer_smooth(only: str | None = None) -> None:
             na = t * t * (3 - 2 * t)
             near = (d < erode + 4 * sigma) & ~keep
             im[..., 3] = np.where(near, na, a) * 255.0
+            if name in OUTER_RING_CUT and keep.any():
+                # Vanilla has a nub on top of the ring (1x rows 0-1, #207):
+                # cut everything above the ring's outer circle, fitted to
+                # its free-standing flanks (above where the bar joins).
+                top, join = OUTER_RING_CUT[name]
+                rs = []
+                for y in range(top, join):
+                    xs = np.nonzero(im[y, :, 3] >= 128)[0]
+                    xs = xs[np.abs(xs + 0.5 - cx) < r + 40]
+                    if len(xs):
+                        rs += [np.hypot(xs[0] + 0.5 - cx, y + 0.5 - cy), np.hypot(xs[-1] + 0.5 - cx, y + 0.5 - cy)]
+                if rs:
+                    ro = float(np.median(rs))
+                    dd = np.hypot(xx + 0.5 - cx, yy + 0.5 - cy)
+                    zone = (yy < join) & (np.abs(xx + 0.5 - cx) < ro + 2)
+                    im[..., 3] = np.where(zone, im[..., 3] * np.clip(ro - dd + 0.5, 0, 1), im[..., 3])
+                    print(f"{name}/{src.name}: cut above ring r={ro:.1f}")
             Image.fromarray(np.clip(im + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / src.name)
             print(f"{name}/{src.name}: outer edge smoothed")
 
