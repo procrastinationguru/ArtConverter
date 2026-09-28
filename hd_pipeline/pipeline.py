@@ -2578,6 +2578,56 @@ def cmd_hd_disc_mask(only: str | None = None) -> None:
         print(f"{name}: disc mask r={r} at ({cx}, {cy})")
 
 
+# Inventory paperdoll slot silhouettes (inven_ui.c item_ui_item_silhouette_nums,
+# blitted at inven_ui_inventory_paperdoll_inv_slot_rects over PDoll): opaque
+# rects carrying their own copy of the slot grid, a few levels off PDoll's.
+# Upscaled separately, the grid under an empty slot changed colour in HD
+# (#189 #190). The sidecar keeps only the silhouette (vanilla pixels that
+# differ from PDoll's there); the panel's own HD grid shows through (the
+# window background is redrawn before them on every refresh).
+CVR_SLOTS = {
+    "CVR_Helmet": (151, 107), "CVR_Ring1": (247, 107), "CVR_Ring2": (279, 107),
+    "CVR_Medalion": (247, 139), "CVR_Weapon": (23, 170), "CVR_Shield": (247, 171),
+    "CVR_Armor": (119, 171), "CVR_Gauntlet": (55, 107), "CVR_Boot": (150, 331),
+}
+
+
+def cmd_hd_cvr_mask(only: str | None = None) -> None:
+    from PIL import ImageFilter
+    from scipy import ndimage
+    bg_wd = cmd_unpack("art/interface/PDoll.ART", quiet=True)
+    bg = np.asarray(Image.open(sorted(bg_wd.glob("*.bmp"))[0]).convert("RGB")).astype(np.int32)
+    for name, (x, y) in CVR_SLOTS.items():
+        if only is not None and only.lower() not in name.lower():
+            continue
+        rel = f"art/interface/{name}.ART"
+        wd = cmd_unpack(rel, quiet=True)
+        out_dir = hd_out_dir(rel)
+        backup = config.WORK_DIR / "_cvr_originals" / name
+        if not backup.exists():
+            shutil.copytree(out_dir, backup)
+        for bmp in sorted(wd.glob("*.bmp")):
+            frame = int(bmp.stem.rsplit("_", 1)[1])
+            c = np.asarray(Image.open(bmp).convert("RGB")).astype(np.int32)
+            h, w = c.shape[:2]
+            under = bg[y:y + h, x:x + w]
+            if under.shape != c.shape:
+                print(f"{name}: slot rect off the panel, skipped")
+                continue
+            sil = np.abs(under - c).sum(axis=2) > 24
+            sil = ndimage.binary_dilation(sil, iterations=1)
+            m = Image.fromarray((sil * 255).astype(np.uint8), "L").resize((w * HD_SCALE, h * HD_SCALE), Image.BILINEAR)
+            m = np.asarray(m.filter(ImageFilter.GaussianBlur(1.0)), dtype=np.float32) / 255.0
+            src = backup / f"r0_f{frame}.png"
+            a = np.asarray(Image.open(src).convert("RGBA")).astype(np.float32)
+            if a.shape[:2] != m.shape:
+                print(f"{name}: sidecar {a.shape[:2]} != {m.shape}, skipped")
+                continue
+            a[..., 3] *= m
+            Image.fromarray(np.clip(a + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / src.name)
+            print(f"{name} f{frame}: silhouette {sil.mean():.0%} of the slot")
+
+
 def cmd_hd_lens_rings(only: str | None = None, out_root: Path | None = None) -> None:
     """Smooth the lens ring sidecars' hole edge (see LENS_RINGS). Originals go
     to work/_lens_originals/ once; always rebuilt from those."""
@@ -2946,6 +2996,8 @@ def main() -> None:
     p_fonts = sub.add_parser("hd-fonts", help="Glyph sidecars for the vanilla bitmap fonts, rendered from fonts/vanilla/ TTFs in each glyph's own cell")
     p_fonts.add_argument("--only", default=None, help="Only fonts whose path contains this text")
 
+    p_cvr = sub.add_parser("hd-cvr-mask", help="Paperdoll slot silhouettes: keep only the silhouette (CVR_SLOTS)")
+    p_cvr.add_argument("--only", default=None)
     p_disc = sub.add_parser("hd-disc-mask", help="Cut round buttons' sidecars to their disc (DISC_MASKS)")
     p_disc.add_argument("--only", default=None)
     p_lens = sub.add_parser("hd-lens-rings", help="Smooth the PC lens ring sidecars' hole edge (LENS_RINGS)")
@@ -3034,6 +3086,9 @@ def main() -> None:
         return
     if args.command == "hd-lens-rings":
         cmd_hd_lens_rings(args.only)
+        return
+    if args.command == "hd-cvr-mask":
+        cmd_hd_cvr_mask(args.only)
         return
     if args.command == "hd-disc-mask":
         cmd_hd_disc_mask(args.only)
