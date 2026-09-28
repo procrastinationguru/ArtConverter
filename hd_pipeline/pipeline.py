@@ -2269,6 +2269,22 @@ def cmd_hd_buttons(names: list[str], model: str | None = None) -> None:
             print(f"  {bmp.name} -> {dest.relative_to(config.HD_OVERLAY_DIR)}")
 
 
+# The UI text face (Flare12/14, pork12, Garmond9, Nick16, Euph30 - Grenze
+# until round 8 pass 6). Change it here: (file in fonts/vanilla/, variable-
+# font weight or None, download URL used when the file is missing).
+MAIN_FONT = ("Outfit[wght].ttf", 400,
+             "https://github.com/google/fonts/raw/main/ofl/outfit/Outfit%5Bwght%5D.ttf")
+MAIN_FONT_ARTS = [
+    "art/interface/Euph30Font.ART",
+    "art/interface/Flare12Font.ART",
+    "art/interface/Flare14Font.ART",
+    "art/interface/Garmond9Font.ART",
+    "art/interface/Nick16Font.ART",
+    "art/interface/pork12font.art",
+]
+# Download URLs for fonts not kept in the repo (fetched on first use).
+FONT_URLS = {MAIN_FONT[0]: MAIN_FONT[2]}
+
 # Vanilla bitmap font art -> (TTF/OTF in fonts/vanilla/, variable-font weight
 # or None). See fonts/vanilla/README.md for where each came from.
 FONT_TTF = {
@@ -2282,13 +2298,9 @@ FONT_TTF = {
     "art/interface/Comic12Font.ART": ("comic.ttf", None),
     "art/interface/Courier10Font.ART": ("cour.ttf", None),
     "art/interface/Elga12Font.ART": ("CrimsonPro[wght].ttf", 800),
-    "art/interface/Euph30Font.ART": ("Grenze[wght].ttf", 400),
-    "art/interface/Flare12Font.ART": ("Grenze[wght].ttf", 300),
-    "art/interface/Flare14Font.ART": ("Grenze[wght].ttf", 300),
     "art/interface/LogbookFont.ART": ("JimNightshade-Regular.ttf", None),
     "art/interface/Garmond6Font.ART": ("EBGaramond.ttf", 600),
     "art/interface/Garmond8Font.ART": ("EBGaramond.ttf", 600),
-    "art/interface/Garmond9Font.ART": ("Grenze[wght].ttf", 300),
     "art/interface/Icons17Font.ART": ("MORPHEUS.TTF", None),
     "art/interface/Icons32Font.ART": ("MORPHEUS.TTF", None),
     "art/interface/NewsIconsFont.ART": (None, None),
@@ -2300,13 +2312,27 @@ FONT_TTF = {
     "art/interface/Morph30Font.ART": ("MORPHEUS.TTF", None),
     "art/morph15font.ART": ("MORPHEUS.TTF", None),
     "art/interface/NewTimes16Font.ART": ("times.ttf", None),
-    "art/interface/Nick16Font.ART": ("Grenze[wght].ttf", 300),
     "art/interface/Pepper20Font.ART": ("Fondamento-Italic.ttf", None),
-    "art/interface/pork12font.art": ("Grenze[wght].ttf", 300),
     "art/interface/Swiss921Font.ART": ("Anton-Regular.ttf", None),
     "art/interface/Zurich16Font.ART": ("ArchivoNarrow[wght].ttf", 700),
     "art/interface/Zurich20Font.ART": ("ArchivoNarrow[wght].ttf", 700),
 }
+FONT_TTF.update({rel: MAIN_FONT[:2] for rel in MAIN_FONT_ARTS})
+# Fonts fitted uniformly (see _fit_glyph `uniform`): one x scale and the
+# shared baseline for every letter.
+FONT_UNIFORM: set[str] = set(MAIN_FONT_ARTS)
+
+
+def ensure_font(ttf: str) -> Path:
+    """fonts/vanilla/<ttf>, downloaded from FONT_URLS if missing."""
+    path = FONT_DIR / ttf
+    if not path.exists() and ttf in FONT_URLS:
+        import urllib.request
+        print(f"downloading {ttf} from {FONT_URLS[ttf]}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(FONT_URLS[ttf]) as r:
+            path.write_bytes(r.read())
+    return path
 # Fonts whose vanilla lower case is drawn as capitals.
 FONT_CAPS_ONLY = {"art/interface/LatinXCN30Font.ART"}
 # Glyphs that are pictures, not letters (Icons17/32Font's digits are the
@@ -2442,8 +2468,27 @@ def _scale_glyph(cell: np.ndarray, f: float, base: int) -> np.ndarray:
     return out
 
 
+def _squash_rows(canvas: np.ndarray, top: int, h: int, bl: int) -> np.ndarray:
+    """Rows [top, top + h) of `canvas`; ink above / below that is squashed
+    in, separately above and below the baseline row `bl`."""
+    ys = np.nonzero(canvas.max(axis=1) > 0.02)[0]
+    out = canvas[top:top + h].copy()
+    if len(ys) == 0:
+        return out
+    y0, y1 = int(ys[0]), int(ys[-1]) + 1
+    if y0 < top and bl > top:
+        part = Image.fromarray((canvas[y0:bl] * 255).astype(np.uint8), "L")
+        part = part.resize((canvas.shape[1], bl - top), Image.LANCZOS)
+        out[:bl - top] = np.asarray(part, dtype=np.float32) / 255.0
+    if y1 > top + h and bl < top + h:
+        part = Image.fromarray((canvas[bl:y1] * 255).astype(np.uint8), "L")
+        part = part.resize((canvas.shape[1], top + h - bl), Image.LANCZOS)
+        out[bl - top:] = np.asarray(part, dtype=np.float32) / 255.0
+    return out
+
+
 def _fit_glyph(a: np.ndarray, base: int, vb, ch: str, x_scale: float, by: int, cw: int, chh: int, k: int,
-               pen: int | None = None):
+               pen: int | None = None, uniform: bool = False, pad: int = 0):
     """Place one TTF-rendered glyph (coverage `a`, baseline row `base`) in
     its cell (cw x chh, baseline row `by`, all in supersampled px; k =
     vanilla px -> supersampled px) so its ink lands where the vanilla ink
@@ -2456,23 +2501,28 @@ def _fit_glyph(a: np.ndarray, base: int, vb, ch: str, x_scale: float, by: int, c
     (the TTF pen column in `a`): no per-glyph fit, the font-wide scale on
     the baseline with the pen at the cell's left edge, as the TTF lays it
     out (fonts nothing like vanilla's, e.g. a joined handwriting whose
-    strokes must meet). Whatever still overflows the cell is squashed
-    above / below the baseline separately.
+    strokes must meet). `uniform` (FONT_UNIFORM): the font-wide x scale
+    and the shared baseline for every letter, centred on the vanilla ink
+    (no per-glyph width / height fit - that made letters jump and change
+    width, #225); digits still get the height fit. Whatever still
+    overflows the cell is squashed above / below the baseline separately.
     Returns (coverage, x0, y0) or None."""
     tc = _ink_box(a, 0.02)
     tb = _ink_box(a, 0.5) or tc
     if tc is None:
         return None
     vx0, vy0, vx1, vy1 = (v * k for v in vb)
+    vy0, vy1 = vy0 + pad, vy1 + pad  # cell padded above by `pad` rows
     tw, th = max(1, tb[2] - tb[0]), max(1, tb[3] - tb[1])
     free = pen is not None
     sx = x_scale
-    if vb[2] - vb[0] >= 3 and not free:
+    if vb[2] - vb[0] >= 3 and not free and not uniform:
         sx = x_scale * float(np.clip((vx1 - vx0) / (tw * x_scale), 0.8, 1.25))
     sy = 1.0
     oy = by - (base - tb[1])  # cell row of the ink-box top on the shared baseline
     tol = 1.5 * k
-    if not free and vb[3] - vb[1] >= 2 and (ch.isdigit() or abs(oy - vy0) > tol or abs(oy + th - vy1) > tol):
+    off = abs(oy - vy0) > tol or abs(oy + th - vy1) > tol
+    if not free and vb[3] - vb[1] >= 2 and (ch.isdigit() or (off and not uniform)):
         want = (vy1 - vy0) / th
         sy = float(np.clip(want, 0.8, 1.25))
         oy = vy0 if sy == want else vy1 - th * sy
@@ -2900,6 +2950,7 @@ def cmd_hd_fonts(only: str | None = None, ttf_override: tuple | None = None,
         cap = FONT_CAP.get(rel, 1.0)
         scale = FONT_SCALE.get(rel, 1.0)
         free = rel in FONT_FREE_FIT
+        uniform = rel in FONT_UNIFORM
         if ttf_override is not None:
             ttf, weight, thin, cap, free = (tuple(ttf_override) + (0.0, 1.0, False)[len(ttf_override) - 2:])[:5]
         src_rel = FONT_ALIAS.get(rel, rel)
@@ -2919,7 +2970,7 @@ def cmd_hd_fonts(only: str | None = None, ttf_override: tuple | None = None,
         caps = rel in FONT_CAPS_ONLY
 
         def load(size: int):
-            font = ImageFont.truetype(str(FONT_DIR / ttf), size)
+            font = ImageFont.truetype(str(ensure_font(ttf)), size)
             if weight is not None:
                 font.set_variation_by_axes([weight])
             return font
@@ -2976,6 +3027,7 @@ def cmd_hd_fonts(only: str | None = None, ttf_override: tuple | None = None,
             ch = _glyph_char(f["frame"])
             vb = _ink_box(f["cov"])
             drawn = False
+            scaled = False
             if vb is not None and _is_picto(rel, ch, f["w"]):
                 tmp = config.WORK_DIR / "_font_picto"
                 tmp.mkdir(parents=True, exist_ok=True)
@@ -2994,13 +3046,26 @@ def cmd_hd_fonts(only: str | None = None, ttf_override: tuple | None = None,
                         length = font.getlength(ch.upper() if caps else ch)
                         if advances.get(f["frame"], 0) > 0 and length > 0:
                             gx = float(np.clip(advances[f["frame"]] * s * ss / length, x_scale * 0.75, x_scale * 1.33))
-                    g = _fit_glyph(a, base, vb, ch, gx, baseline * s * ss, W * ss, H * ss, s * ss,
-                                   pen if free else None)
+                    # Uniform + FONT_SCALE: fit into a cell padded above and
+                    # below, scale, and only then squash what still
+                    # overflows - squashing first flattened descenders
+                    # ('y' read as 'v', #225).
+                    pad = H * ss if uniform and scale != 1.0 else 0
+                    bl = baseline * s * ss
+                    g = _fit_glyph(a, base, vb, ch, gx, bl + pad, W * ss, H * ss + 2 * pad, s * ss,
+                                   pen if free else None, uniform, pad)
                     if g is not None:
                         g, x0, y0 = g
-                        ys0, ys1 = max(0, y0), min(H * ss, y0 + g.shape[0])
+                        canvas = np.zeros((H * ss + 2 * pad, W * ss), np.float32)
+                        ys0, ys1 = max(0, y0), min(canvas.shape[0], y0 + g.shape[0])
                         if ys1 > ys0:
-                            cell[ys0:ys1, x0:x0 + g.shape[1]] = g[ys0 - y0:ys1 - y0]
+                            canvas[ys0:ys1, x0:x0 + g.shape[1]] = g[ys0 - y0:ys1 - y0]
+                            if pad:
+                                canvas = _scale_glyph(canvas, scale, bl + pad)
+                                cell = _squash_rows(canvas, pad, H * ss, bl + pad)
+                                scaled = True
+                            else:
+                                cell = canvas
                             drawn = True
             if not drawn and vb is not None:
                 up = Image.fromarray((f["cov"] * 255).astype(np.uint8), "L").resize((W * ss, H * ss), Image.LANCZOS)
@@ -3008,7 +3073,7 @@ def cmd_hd_fonts(only: str | None = None, ttf_override: tuple | None = None,
                 fallback += 1
             if thin != 0 and drawn and not _is_picto(rel, ch, f["w"]):
                 cell = _thin(cell, thin * ss, 1.5 * ss)
-            if scale != 1.0 and drawn and not _is_picto(rel, ch, f["w"]):
+            if scale != 1.0 and drawn and not scaled and not _is_picto(rel, ch, f["w"]):
                 cell = _scale_glyph(cell, scale, baseline * s * ss)
             alpha = Image.fromarray((np.clip(cell, 0, 1) * 255).astype(np.uint8), "L").resize((W, H), Image.BOX)
             rgba = Image.new("RGBA", (W, H), (255, 255, 255, 0))
