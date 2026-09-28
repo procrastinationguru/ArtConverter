@@ -2630,7 +2630,8 @@ def cmd_hd_cvr_mask(only: str | None = None) -> None:
 
 # Gold panel frames that came out wobbly / stair-stepped (#191): a 5 px
 # median (rounds the contours) + slight blur, only near the gold, feathered.
-FRAME_SMOOTH = ["PDoll", "Inventor"]
+# name -> vanilla-px rects left alone (icons drawn into the panel).
+FRAME_SMOOTH = {"PDoll": [], "Inventor": [(325, 55, 400, 230)]}
 
 
 def cmd_hd_frame_smooth(only: str | None = None, size: int = 5) -> None:
@@ -2648,6 +2649,8 @@ def cmd_hd_frame_smooth(only: str | None = None, size: int = 5) -> None:
             r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
             gold = ndimage.binary_opening((r - b > 60) & (r > 100) & (g > 50), iterations=1)
             zone = ndimage.binary_dilation(gold, iterations=6)
+            for x0, y0, x1, y1 in FRAME_SMOOTH[name]:
+                zone[y0 * HD_SCALE:y1 * HD_SCALE, x0 * HD_SCALE:x1 * HD_SCALE] = False
             w = ndimage.gaussian_filter(zone.astype(np.float32), 2.0)[..., None]
             med = np.stack([ndimage.median_filter(rgb[..., c], size=size) for c in range(3)], -1)
             med = ndimage.gaussian_filter(med, (0.7, 0.7, 0))
