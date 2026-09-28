@@ -2406,7 +2406,18 @@ FONT_TTF = {
     "art/interface/ArialB12Font.ART": ("arialbd.ttf", None),
     "art/interface/BookmanOldBold18Font.ART": ("texgyrebonum-bold.otf", None),
     "art/interface/casablanca16font.art": ("IMFeENrm28P.ttf", None),
-    "art/interface/CasablancaAntique30Font.ART": ("IMFeENrm28P.ttf", None),
+    # Round 8 pass 9 (#14/#28): schematic discipline title + description in a
+    # typewriter face, "Special Elite" (Google Fonts, Astigmatic). Exclusive
+    # to schematic_ui.c (not in MAIN_FONT_ARTS), so it's safe to remap
+    # directly rather than needing a SchemDescFont-style art alias.
+    "art/interface/CasablancaAntique30Font.ART": ("SpecialElite-Regular.ttf", None),
+    "art/interface/SchemDescFont.ART": ("SpecialElite-Regular.ttf", None),
+    # Round 8 pass 9 (#19): Save/Load Game screen's save names in a header-
+    # ish weight, not the rest-of-UI Outfit 400 (MAIN_FONT). Exclusive to
+    # mainmenu_ui.c's two save/load list+preview fonts, so a SaveLoadListFont
+    # alias (like SchemDescFont/LogbookFont) rather than a MAIN_FONT_ARTS
+    # entry, which would apply 400 everywhere Flare12Font.ART is used.
+    "art/interface/SaveLoadListFont.ART": ("Outfit[wght].ttf", 500),
     "art/interface/ClarendonBLK18Font.ART": ("Coustard-Black.ttf", None),
     "art/interface/Cloister18Font.ART": ("CloisterBlack.ttf", None),
     "art/interface/Comic12Font.ART": ("comic.ttf", None),
@@ -2471,8 +2482,14 @@ def _is_picto(rel: str, ch: str | None, width: int) -> bool:
 # Font arts that don't exist in vanilla: a copy of another font art (same
 # cells and advances) the engine loads from the game's data/ folder, so one
 # UI can have its own glyphs. LogbookFont = the logbook body in a
-# handwriting (logbook_ui.c, interface art 4000 in name.c).
-FONT_ALIAS = {"art/interface/LogbookFont.ART": "art/interface/Flare12Font.ART"}
+# handwriting (logbook_ui.c, interface art 4000 in name.c). SchemDescFont =
+# the schematic screen's discipline description in a typewriter face
+# (schematic_ui.c, interface art 4003 in name.c, round 8 pass 9 #14/#28).
+FONT_ALIAS = {
+    "art/interface/LogbookFont.ART": "art/interface/Flare12Font.ART",
+    "art/interface/SchemDescFont.ART": "art/interface/Flare12Font.ART",
+    "art/interface/SaveLoadListFont.ART": "art/interface/Flare12Font.ART",
+}
 
 # Stroke thinning in HD px for single-weight fonts that render too heavy;
 # negative emboldens (hairline scripts).
