@@ -2177,7 +2177,9 @@ BUTTON_MODEL.update({name: "remacri-4x" for name in REMACRI_UI})
 # big Skills/Spells/Schematics/common-skills buttons (round 8, twice).
 BUTTON_MODEL.update({name: "realesrgan-x4plus" for name in
                      ("Thieving_But", "Technological_But", "Social_But",
-                      "Skills_Button", "Spells_Button", "Schematics_Button", "char_Common_Skills")})
+                      "Skills_Button", "Spells_Button", "Schematics_Button", "char_Common_Skills",
+                      # pass 4: the rest of the charedit row, to match the HUD ones
+                      "char_Tech_Skills", "char_Spells_Skills", "char_Schem_Skills")})
 # Round 8 remacri pass (user: remacri wins on small assets - checked in game,
 # then fixed one by one): A = small arrow / +- controls, B = small symbol
 # icons, C = cursors. See docs/ROUND8_PLAN.md.
@@ -2208,6 +2210,8 @@ REMACRI_SMALL = (
     "Scroll-1 Scroll-2 Scroll-3 Scroll-4 Scroll-5 Scroll-6 Scroll-7 Scroll_not"
 ).split()
 BUTTON_MODEL.update({name: "remacri-4x" for name in REMACRI_SMALL})
+# Round 8 pass 4: the dialog text toggle (nav bar) read blurry in x4plus.
+BUTTON_MODEL["TextToggle"] = "remacri-4x"
 
 
 BUTTON_MIN_SIDE = 64
@@ -2543,6 +2547,35 @@ def lens_ring_alpha(rgba: np.ndarray, pct: float = 50) -> tuple[np.ndarray, floa
     band = np.abs(d - r_in) < 6.0
     alpha = np.where(band, np.clip(d - r_in + 0.5, 0, 1), np.where(hole, 0.0, a))
     return (alpha * 255.0 + 0.5).astype(np.uint8), r_in
+
+
+# Round buttons whose vanilla art is a dark disc with a clipped crescent of
+# rim on one side (it sits in a socket drawn by the panel under it): the
+# sidecar is cut to the disc so only the socket's own ring shows around it.
+# name -> (centre x, centre y, radius) in vanilla px.
+DISC_MASKS = {
+    "lilgrnbut": (10.625, 11.125, 11.0),  # HUD fate / sleep buttons in IntTop
+}
+
+
+def cmd_hd_disc_mask(only: str | None = None) -> None:
+    """Cut DISC_MASKS buttons' sidecars to a circle (1 HD px feather). The
+    unmasked sidecars are kept in work/_disc_originals/ and always used as
+    the input, so reruns don't compound."""
+    for name, (cx, cy, r) in DISC_MASKS.items():
+        if only is not None and only.lower() not in name.lower():
+            continue
+        out_dir = hd_out_dir(f"art/interface/{name}.ART")
+        backup = config.WORK_DIR / "_disc_originals" / name
+        if not backup.exists():
+            shutil.copytree(out_dir, backup)
+        for src in sorted(backup.glob("*.png")):
+            a = np.asarray(Image.open(src).convert("RGBA")).astype(np.float32)
+            yy, xx = np.mgrid[0:a.shape[0], 0:a.shape[1]] + 0.5
+            d = np.hypot(xx - cx * HD_SCALE, yy - cy * HD_SCALE)
+            a[..., 3] *= np.clip((r * HD_SCALE - d) / 2 + 0.5, 0, 1)
+            Image.fromarray(np.clip(a + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / src.name)
+        print(f"{name}: disc mask r={r} at ({cx}, {cy})")
 
 
 def cmd_hd_lens_rings(only: str | None = None, out_root: Path | None = None) -> None:
@@ -2913,6 +2946,8 @@ def main() -> None:
     p_fonts = sub.add_parser("hd-fonts", help="Glyph sidecars for the vanilla bitmap fonts, rendered from fonts/vanilla/ TTFs in each glyph's own cell")
     p_fonts.add_argument("--only", default=None, help="Only fonts whose path contains this text")
 
+    p_disc = sub.add_parser("hd-disc-mask", help="Cut round buttons' sidecars to their disc (DISC_MASKS)")
+    p_disc.add_argument("--only", default=None)
     p_lens = sub.add_parser("hd-lens-rings", help="Smooth the PC lens ring sidecars' hole edge (LENS_RINGS)")
     p_lens.add_argument("--only", default=None)
 
@@ -2999,6 +3034,9 @@ def main() -> None:
         return
     if args.command == "hd-lens-rings":
         cmd_hd_lens_rings(args.only)
+        return
+    if args.command == "hd-disc-mask":
+        cmd_hd_disc_mask(args.only)
         return
         
     if args.command == "hd-scan":
