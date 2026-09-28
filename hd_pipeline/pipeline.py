@@ -2418,6 +2418,7 @@ FONT_TTF = {
     # alias (like SchemDescFont/LogbookFont) rather than a MAIN_FONT_ARTS
     # entry, which would apply 400 everywhere Flare12Font.ART is used.
     "art/interface/SaveLoadListFont.ART": ("Outfit[wght].ttf", 500),
+    "art/interface/CharStatsFont.ART": ("Outfit[wght].ttf", 500),
     "art/interface/ClarendonBLK18Font.ART": ("Coustard-Black.ttf", None),
     "art/interface/Cloister18Font.ART": ("CloisterBlack.ttf", None),
     "art/interface/Comic12Font.ART": ("comic.ttf", None),
@@ -2489,6 +2490,7 @@ FONT_ALIAS = {
     "art/interface/LogbookFont.ART": "art/interface/Flare12Font.ART",
     "art/interface/SchemDescFont.ART": "art/interface/Flare12Font.ART",
     "art/interface/SaveLoadListFont.ART": "art/interface/Flare12Font.ART",
+    "art/interface/CharStatsFont.ART": "art/interface/morph15font.art",
 }
 
 # Stroke thinning in HD px for single-weight fonts that render too heavy;
@@ -2506,6 +2508,19 @@ FONT_SCALE: dict[str, float] = {
 }
 # Fonts placed with the font-wide scale only (see _fit_glyph).
 FONT_FREE_FIT: set[str] = {"art/interface/LogbookFont.ART"}
+# Per-font x scale override, skipping the letter-width-ratio measurement
+# below: for an aliased font swapped to an unrelated TTF (FONT_ALIAS), that
+# ratio is measured against the ALIAS SOURCE's letter widths, not the new
+# TTF's own - e.g. Special Elite (a typewriter face) matched against
+# Flare12Font/CasablancaAntique30Font's much narrower vanilla letters came
+# out visibly squeezed (round 8 pass 9/10 #14/#28/#44 - "we're changing only
+# font size, not squeezing it horizontally to fit"). 1.0 keeps the TTF's own
+# natural proportions; layout (advances/wrapping/centring) still follows the
+# vanilla cell per cmd_hd_fonts' docstring, unaffected by this.
+FONT_XSCALE: dict[str, float] = {
+    "art/interface/CasablancaAntique30Font.ART": 1.0,
+    "art/interface/SchemDescFont.ART": 1.0,
+}
 
 
 def _thin(cov: np.ndarray, r: float, keep: float) -> np.ndarray:
@@ -3255,6 +3270,7 @@ def cmd_hd_fonts(only: str | None = None, ttf_override: tuple | None = None,
             if tb is not None and tb[2] > tb[0]:
                 ratios.append((vb[2] - vb[0]) * s * ss / (tb[2] - tb[0]))
         x_scale = float(np.clip(np.median(ratios), 0.6, 1.35)) if ratios else 1.0
+        x_scale = FONT_XSCALE.get(rel, x_scale)
 
         out_dir = hd_out_dir(rel) if out_root is None else out_root / Path(rel).with_suffix("")
         out_dir.mkdir(parents=True, exist_ok=True)
