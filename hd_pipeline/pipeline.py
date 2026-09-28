@@ -2279,12 +2279,12 @@ FONT_TTF = {
     "art/interface/Courier10Font.ART": ("cour.ttf", None),
     "art/interface/Elga12Font.ART": ("CrimsonPro[wght].ttf", 800),
     "art/interface/Euph30Font.ART": ("Grenze[wght].ttf", 400),
-    "art/interface/Flare12Font.ART": ("Grenze[wght].ttf", 200),
-    "art/interface/Flare14Font.ART": ("Grenze[wght].ttf", 200),
+    "art/interface/Flare12Font.ART": ("Grenze[wght].ttf", 300),
+    "art/interface/Flare14Font.ART": ("Grenze[wght].ttf", 300),
     "art/interface/LogbookFont.ART": ("JimNightshade-Regular.ttf", None),
     "art/interface/Garmond6Font.ART": ("EBGaramond.ttf", 600),
     "art/interface/Garmond8Font.ART": ("EBGaramond.ttf", 600),
-    "art/interface/Garmond9Font.ART": ("EBGaramond.ttf", 600),
+    "art/interface/Garmond9Font.ART": ("Grenze[wght].ttf", 300),
     "art/interface/Icons17Font.ART": ("MORPHEUS.TTF", None),
     "art/interface/Icons32Font.ART": ("MORPHEUS.TTF", None),
     "art/interface/NewsIconsFont.ART": (None, None),
@@ -2296,9 +2296,9 @@ FONT_TTF = {
     "art/interface/Morph30Font.ART": ("MORPHEUS.TTF", None),
     "art/morph15font.ART": ("MORPHEUS.TTF", None),
     "art/interface/NewTimes16Font.ART": ("times.ttf", None),
-    "art/interface/Nick16Font.ART": ("LindenHill-Regular.ttf", None),
+    "art/interface/Nick16Font.ART": ("Grenze[wght].ttf", 300),
     "art/interface/Pepper20Font.ART": ("Fondamento-Italic.ttf", None),
-    "art/interface/pork12font.art": ("IMFePIrm28P.ttf", None),
+    "art/interface/pork12font.art": ("Grenze[wght].ttf", 300),
     "art/interface/Swiss921Font.ART": ("Anton-Regular.ttf", None),
     "art/interface/Zurich16Font.ART": ("ArchivoNarrow[wght].ttf", 700),
     "art/interface/Zurich20Font.ART": ("ArchivoNarrow[wght].ttf", 700),
@@ -2336,6 +2336,13 @@ FONT_THIN: dict[str, float] = {"art/interface/LogbookFont.ART": -0.5}
 # Cap height as a fraction of the vanilla 'H' (fonts with tall loops that
 # would not fit the vanilla cells otherwise).
 FONT_CAP: dict[str, float] = {}
+# Glyph size after the fit, about each glyph's ink centre and the baseline
+# (layout unchanged): "2 pt smaller" Grenze (user, round 8: 12 -> 10, 14 -> 12).
+FONT_SCALE: dict[str, float] = {
+    "art/interface/Flare12Font.ART": 10 / 12,
+    "art/interface/Flare14Font.ART": 12 / 14,
+    "art/interface/pork12font.art": 10 / 12,
+}
 # Fonts placed with the font-wide scale only (see _fit_glyph).
 FONT_FREE_FIT: set[str] = {"art/interface/LogbookFont.ART"}
 
@@ -2407,6 +2414,28 @@ def _glyph_char(frame: int) -> str | None:
         return bytes([frame + 31]).decode("cp1252")
     except (UnicodeDecodeError, ValueError):
         return None
+
+
+def _scale_glyph(cell: np.ndarray, f: float, base: int) -> np.ndarray:
+    """Resize a cell's ink by f about its ink box's centre column and the
+    baseline row `base` (supersampled px)."""
+    box = _ink_box(cell, 0.02)
+    if box is None:
+        return cell
+    x0, y0, x1, y1 = box
+    g = Image.fromarray((cell[y0:y1, x0:x1] * 255).astype(np.uint8), "L")
+    gw, gh = max(1, int(round(g.width * f))), max(1, int(round(g.height * f)))
+    g = np.asarray(g.resize((gw, gh), Image.LANCZOS), dtype=np.float32) / 255.0
+    nx = int(round((x0 + x1) / 2 - gw / 2))
+    ny = int(round(base - (base - y0) * f))
+    out = np.zeros_like(cell)
+    H, W = cell.shape
+    sx0, sy0 = max(0, -nx), max(0, -ny)
+    dx0, dy0 = max(0, nx), max(0, ny)
+    w, h = min(gw - sx0, W - dx0), min(gh - sy0, H - dy0)
+    if w > 0 and h > 0:
+        out[dy0:dy0 + h, dx0:dx0 + w] = g[sy0:sy0 + h, sx0:sx0 + w]
+    return out
 
 
 def _fit_glyph(a: np.ndarray, base: int, vb, ch: str, x_scale: float, by: int, cw: int, chh: int, k: int,
@@ -2562,6 +2591,7 @@ def cmd_hd_fonts(only: str | None = None, ttf_override: tuple | None = None,
             continue
         thin = FONT_THIN.get(rel, 0.0)
         cap = FONT_CAP.get(rel, 1.0)
+        scale = FONT_SCALE.get(rel, 1.0)
         free = rel in FONT_FREE_FIT
         if ttf_override is not None:
             ttf, weight, thin, cap, free = (tuple(ttf_override) + (0.0, 1.0, False)[len(ttf_override) - 2:])[:5]
@@ -2671,6 +2701,8 @@ def cmd_hd_fonts(only: str | None = None, ttf_override: tuple | None = None,
                 fallback += 1
             if thin != 0 and drawn and not _is_picto(rel, ch, f["w"]):
                 cell = _thin(cell, thin * ss, 1.5 * ss)
+            if scale != 1.0 and drawn and not _is_picto(rel, ch, f["w"]):
+                cell = _scale_glyph(cell, scale, baseline * s * ss)
             alpha = Image.fromarray((np.clip(cell, 0, 1) * 255).astype(np.uint8), "L").resize((W, H), Image.BOX)
             rgba = Image.new("RGBA", (W, H), (255, 255, 255, 0))
             rgba.putalpha(alpha)
