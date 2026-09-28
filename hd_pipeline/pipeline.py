@@ -486,6 +486,120 @@ def cmd_hd_splash(force: bool = False) -> None:
     print(f"Splash: {done} done, {skipped} skipped (already exist, use --force), {failed} failed")
 
 
+# The splashes' "Loading Arcanum..." lettering came out of the upscale
+# lumpy (#228): erased (inpainted) and typeset again. Per splash: (font,
+# variable weight or None, colour, drop shadow, cap height factor, words); a word = (text, HD
+# ink box x0, cap top, x1, baseline) measured on the upscale - the new word
+# gets that cap height and is tracked to span the same box. Words of a line
+# share the first word's size (dots have no capitals).
+SPLASH_FONT_URLS = {
+    "GoudyBookletter1911.ttf": "https://github.com/google/fonts/raw/main/ofl/goudybookletter1911/GoudyBookletter1911.ttf",
+    "CormorantGaramond[wght].ttf": "https://github.com/google/fonts/raw/main/ofl/cormorantgaramond/CormorantGaramond%5Bwght%5D.ttf",
+}
+SPLASH_TEXT = {
+    # Splash1's lower case is small for its capitals (x/cap 0.47, Goudy's
+    # 0.62): capitals 0.88 of the old ones, between the two.
+    "Splash1": ("GoudyBookletter1911.ttf", None, (225, 221, 212), True, 0.88, [
+        [("Loading", 1825, 1340, 2192, 1421), ("Arcanum", 2224, 1338, 2631, 1421), ("...", 2648, None, 2732, 1421)],
+    ]),
+    "Splash2": ("CormorantGaramond[wght].ttf", 500, (215, 213, 210), False, 1.0, [
+        [("Loading", 2121, 1171, 2436, 1219)],
+        [("ARCANUM", 2236, 1264, 2672, 1315), ("...", 2689, None, 2744, 1315)],
+    ]),
+    "Splash3": ("CormorantGaramond[wght].ttf", 500, (208, 212, 205), False, 1.0, [
+        [("Loading", 106, 83, 407, 131), ("Arcanum", 475, 84, 805, 131), ("...", 821, None, 872, 131)],
+    ]),
+}
+
+
+SPLASH_GRAIN_SHIFT = 140  # HD rows: where the grain for a textured fill comes from (above)
+
+
+def cmd_hd_splash_text(only: str | None = None) -> None:
+    """See SPLASH_TEXT. Rebuilt from work/_splash_text_originals/ (the
+    upscale, kept on the first run) every time."""
+    import cv2
+    from PIL import ImageDraw, ImageFilter, ImageFont
+    from scipy import ndimage
+
+    FONT_URLS.update(SPLASH_FONT_URLS)
+    for stem, (ttf, weight, colour, shadow, cap_k, lines) in SPLASH_TEXT.items():
+        if only is not None and only.lower() not in stem.lower():
+            continue
+        dest = config.HD_OVERLAY_DIR / "splash" / f"{stem}_hd.bmp"
+        backup = config.WORK_DIR / "_splash_text_originals" / dest.name
+        if not backup.exists():
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(dest, backup)
+        img = np.asarray(Image.open(backup).convert("RGB")).copy()
+        H, W = img.shape[:2]
+
+        # erase: the ink around every word, grown a bit - on black anything
+        # a little lighter than the box's surroundings (the dim anti-aliased
+        # edges too), on the textured scene (Splash1, the one with a shadow)
+        # only the bright, grey ink
+        mask = np.zeros((H, W), bool)
+        lum = img.mean(axis=2)
+        sat = img.max(axis=2).astype(int) - img.min(axis=2)
+        for line in lines:
+            for _, x0, top, x1, base in line:
+                y0 = (top if top is not None else base - 60) - 16
+                y1 = base + 50  # descenders
+                box = (slice(max(0, y0), min(H, y1)), slice(max(0, x0 - 24), min(W, x1 + 16)))
+                ring = np.concatenate([lum[box][0], lum[box][-1], lum[box][:, 0], lum[box][:, -1]])
+                if not shadow:  # plain black
+                    mask[box] |= (lum[box] > np.median(ring) + 22) & (sat[box] < 80)
+                else:
+                    mask[box] |= (lum[box] > 150) & (sat[box] < 50)
+        mask = ndimage.binary_dilation(mask, iterations=7)
+        filled = cv2.inpaint(np.ascontiguousarray(img[..., ::-1]), mask.astype(np.uint8) * 255, 9, cv2.INPAINT_TELEA)[..., ::-1].astype(np.float32)
+        if shadow:  # textured scene: the smooth fill gets the grain of the ground above
+            up = np.roll(img, SPLASH_GRAIN_SHIFT, axis=0).astype(np.float32)
+            filled += up - ndimage.gaussian_filter(up, (4, 4, 0))
+        m = ndimage.gaussian_filter(mask.astype(np.float32), 1.5)[..., None]
+        img = np.clip(img * (1 - m) + filled * m + 0.5, 0, 255).astype(np.uint8)
+
+        def load(size: float):
+            font = ImageFont.truetype(str(ensure_font(ttf)), size)
+            if weight is not None:
+                font.set_variation_by_axes([weight])
+            return font
+
+        ink = Image.new("L", (W, H), 0)
+        draw = ImageDraw.Draw(ink)
+        for line in lines:
+            size = None
+            for text, x0, top, x1, base in line:
+                if size is None:
+                    cap = (base - top) * cap_k
+                    size = cap * 1.5
+                    for _ in range(4):  # cap height -> size
+                        b = load(size).getbbox("H", anchor="ls")
+                        size *= cap / max(1, b[3] - b[1])
+                font = load(size)
+                advs = [font.getlength(c) for c in text]
+                first = font.getbbox(text[0], anchor="ls")
+                last = font.getbbox(text[-1], anchor="ls")
+
+                def span(t: float) -> float:
+                    return sum(advs[:-1]) + t * (len(text) - 1) + last[2] - first[0]
+
+                track = (x1 - x0 - span(0.0)) / max(1, len(text) - 1)
+                pen = x0 - first[0]
+                for c, adv in zip(text, advs):
+                    draw.text((pen, base), c, font=font, fill=255, anchor="ls")
+                    pen += adv + track
+            print(f"  {stem}: {' '.join(w[0] for w in line)} at {size:.1f}px")
+
+        out = Image.fromarray(np.ascontiguousarray(img), "RGB")
+        if shadow:
+            sh = ink.filter(ImageFilter.GaussianBlur(3)).point(lambda v: int(v * 0.7))
+            out.paste((0, 0, 0), (3, 3), sh)
+        out.paste(colour, (0, 0), ink)
+        out.save(dest, "BMP")
+        print(f"{stem}: lettering redone -> {dest.name}")
+
+
 def cmd_hd_portraits(force: bool = False) -> None:
     """Upscale character portrait BMPs (portrait.c) with config.REALESRGAN_MODEL
     (4xNomos8kSC - user picked this over x4plus/x4plus-anime after a 3-model
@@ -2908,15 +3022,24 @@ def cmd_hd_frame_smooth(only: str | None = None, size: int = 5) -> None:
 # square. Rebuild the corners from the panel's HD wood, mirrored across the
 # square's nearest edge (continuous at the edge; the two mirrors blend
 # along the diagonal). name -> (panel art, lens x, y in the panel). Charedit
-# (Char_PCC) restores its panel in the engine instead. PCWinCvr serves the
-# logbook and the town map (MapMain, same wood there).
+# (Char_PCC) restores its panel in the engine instead.
 # The panels' hole edge also fades 1-2 HD px outside the square (a thin dark
 # line around the lens): that band is made opaque with the wood just beyond
-# it, in every listed panel. name -> ([panels, first = wood source], x, y).
+# it, in every listed panel. (The gold beside the square's sides is the
+# panel's - the ring art's circle is wider than its square.) name ->
+# ([panels, first = wood source], x, y).
 LENS_CORNERS = {
-    "PCWinCvr": (["LogBooks_Side", "MapMain"], 25, 24),
+    "PCWinCvr": (["LogBooks_Side"], 25, 24),
+    "Lns_Map": (["MapMain"], 25, 24),
     "Lns_Papr": (["PDoll"], 11, 9),
+    "Lns_Schm": (["Schematic_Base"], 50, 26),
 }
+# Ring arts that don't exist in vanilla: a copy of another ring (art and its
+# hole-smoothed sidecar) for one panel, where the vanilla ring serves several
+# panels with different wood. Lns_Schm = the schematic screen's Lns_Bart
+# (the book screen keeps Lns_Bart), Lns_Map = the town map's PCWinCvr (the
+# logbook keeps PCWinCvr): interface art 4001 / 4002 in name.c.
+LENS_ALIAS = {"Lns_Schm": "Lns_Bart", "Lns_Map": "PCWinCvr"}
 LENS_CORNER_R = 49.5  # 1x px: the gold ring's outer edge
 LENS_EDGE_BAND = 3  # HD px outside the square rebuilt in the panels
 
@@ -2948,9 +3071,21 @@ def cmd_hd_lens_corners(only: str | None = None) -> None:
     for name, (panels, lx, ly) in LENS_CORNERS.items():
         if only is not None and only.lower() not in name.lower():
             continue
-        out_dir = hd_out_dir(f"art/interface/{name}.ART")
+        rel = f"art/interface/{name}.ART"
+        out_dir = hd_out_dir(rel)
         backup = config.WORK_DIR / "_lens_corner_originals" / name
-        if not backup.exists():
+        if name in LENS_ALIAS:
+            # the engine's copy of the source art (data/ is a file repository);
+            # the ring source is the alias target's current sidecar
+            src_rel = f"art/interface/{LENS_ALIAS[name]}.ART"
+            dest = config.HD_OVERLAY_DIR.parent / "data" / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(find_source_art(src_rel), dest)
+            backup = config.WORK_DIR / "_lens_corner_originals" / LENS_ALIAS[name]
+            if not backup.exists():  # not given corners itself
+                backup = hd_out_dir(src_rel)
+            out_dir.mkdir(parents=True, exist_ok=True)
+        elif not backup.exists():
             shutil.copytree(out_dir, backup)
         n = Image.open(backup / "r0_f0.png").width
         for p in panels:
@@ -3169,6 +3304,125 @@ def cmd_hd_fonts(only: str | None = None, ttf_override: tuple | None = None,
         print(f"{rel}: {len(frames)} glyphs from {ttf} at {size / ss:.1f}px x{x_scale:.2f}, {picto} pictures, {fallback} vanilla fallbacks")
 
 
+# Text the face size is matched on (FONT_FACE): typical UI / dialogue text.
+FACE_SAMPLE = ("Having been given the strange ring by Preston Radcliffe, you are currently "
+               "attempting to find its owner. Shall we trade? Could you heal me? The Discipline "
+               "of the Smithy has been revolutionized by technology!")
+
+
+def cmd_hd_font_faces(only: str | None = None) -> None:
+    """MAIN_FONT drawn as itself at HD (round 8 pass 7, #229-#236): no
+    per-cell fitting - its own glyph shapes, advances and kerning. The
+    engine (font.c, tig_font_hd_face) lays each line out with these HD
+    advances from the vanilla line's start (or centre), so only the 1x
+    layout (wrapping, centring) keeps the vanilla metrics. Size: the one
+    whose FACE_SAMPLE width matches the vanilla font's, so lines wrap about
+    where the HD text ends; never taller than the vanilla capitals.
+    Output: hd/<art>/face.txt ("g frame advance ox oy": HD px, image
+    top-left from the pen / the cell top; "k frame frame adjust": kerning)
+    and hd/<art>/face/f<frame>.png (white, coverage as alpha)."""
+    import uharfbuzz as hb
+    from PIL import ImageDraw, ImageFont
+
+    s = HD_SCALE
+    ttf, weight = MAIN_FONT[:2]
+    path = ensure_font(ttf)
+    hb_face = hb.Face(hb.Blob.from_file_path(str(path)))
+    hb_font = hb.Font(hb_face)
+    if weight is not None:
+        hb_font.set_variations({"wght": weight})
+    upem = hb_face.upem
+
+    def shape(text: str) -> list:
+        buf = hb.Buffer()
+        buf.add_str(text)
+        buf.guess_segment_properties()
+        hb.shape(hb_font, buf, {"liga": False, "clig": False})
+        return buf.glyph_positions
+
+    def width_em(text: str) -> float:
+        return sum(p.x_advance for p in shape(text)) / upem
+
+    cap_ext = hb_font.get_glyph_extents(hb_font.get_nominal_glyph(ord("H")))
+    cap_em = -cap_ext.height / upem
+
+    for rel in MAIN_FONT_ARTS:
+        if only is not None and only.lower() not in rel.lower():
+            continue
+        wd = cmd_unpack(rel, quiet=True)
+        basename = Path(rel).name.rsplit(".", 1)[0]
+        frames = _font_frames(wd, basename)
+        advances = _font_advances(wd / (basename + ".ini"))
+        by_frame = {f["frame"]: f for f in frames}
+        ref = _ink_box(by_frame[ord("H") - 31]["cov"])
+        vw = sum(advances.get(ord(c) - 31, 0) for c in FACE_SAMPLE)
+        size = min(vw / width_em(FACE_SAMPLE), (ref[3] - ref[1]) / cap_em)  # vanilla px
+        px = size * s  # HD px per em
+        baseline = ref[3] * s  # HD row of the baseline in the cell
+
+        font = ImageFont.truetype(str(path), px)
+        if weight is not None:
+            font.set_variation_by_axes([weight])
+
+        out_dir = hd_out_dir(rel)
+        face_dir = out_dir / "face"
+        if face_dir.exists():
+            shutil.rmtree(face_dir)
+        face_dir.mkdir(parents=True)
+        lines = [f"# {ttf} wght {weight} {px:.2f} HD px/em"]
+        chars = {}
+        fallback = 0
+        for f in frames:
+            ch = _glyph_char(f["frame"])
+            if ch is None or ch in "\t\n":
+                continue
+            gid = hb_font.get_nominal_glyph(ord(ch))
+            if gid is None or gid == 0:
+                # not in the face: the vanilla glyph, smoothly upscaled
+                cov = f["cov"]
+                if _ink_box(cov) is not None:
+                    up = Image.fromarray((cov * 255).astype(np.uint8), "L").resize((f["w"] * s, f["h"] * s), Image.LANCZOS)
+                    rgba = Image.new("RGBA", up.size, (255, 255, 255, 0))
+                    rgba.putalpha(up)
+                    rgba.save(face_dir / f"f{f['frame']}.png")
+                    lines.append(f"g {f['frame']} {advances.get(f['frame'], 0) * s} 0 0")
+                else:
+                    lines.append(f"g {f['frame']} {advances.get(f['frame'], 0) * s} 0 0 -")
+                fallback += 1
+                continue
+            chars[ch] = f["frame"]
+            adv = hb_font.get_glyph_h_advance(gid) * px / upem
+            if not ch.strip():
+                lines.append(f"g {f['frame']} {adv:.3f} 0 0 -")
+                continue
+            pad = int(px)
+            img = Image.new("L", (int(px * 3) + 2 * pad, int(px * 2.5) + 2 * pad), 0)
+            pen_x, base_y = pad, pad + int(px * 1.5)
+            ImageDraw.Draw(img).text((pen_x, base_y), ch, font=font, fill=255, anchor="ls")
+            box = img.getbbox()
+            if box is None:
+                lines.append(f"g {f['frame']} {adv:.3f} 0 0 -")
+                continue
+            crop = img.crop(box)
+            rgba = Image.new("RGBA", crop.size, (255, 255, 255, 0))
+            rgba.putalpha(crop)
+            rgba.save(face_dir / f"f{f['frame']}.png")
+            lines.append(f"g {f['frame']} {adv:.3f} {box[0] - pen_x} {box[1] - base_y + baseline}")
+
+        # kerning: pair advance minus the two glyphs' own
+        pairs = 0
+        items = [(c, fr) for c, fr in chars.items() if 32 < ord(c) < 127 or c.isalpha()]
+        single = {c: width_em(c) for c, _ in items}
+        for a, fa in items:
+            for b, fb in items:
+                adj = (width_em(a + b) - single[a] - single[b]) * px
+                if abs(adj) >= 0.25:
+                    lines.append(f"k {fa} {fb} {adj:.2f}")
+                    pairs += 1
+        (out_dir / "face.txt").write_text("\n".join(lines) + "\n")
+        print(f"{rel}: {ttf} at {size:.1f}px ({px:.1f} HD), {len(chars)} glyphs, {pairs} kerning pairs, {fallback} vanilla fallbacks")
+
+
 def cmd_hd_compose(only: str | None = None, model: str | None = None, dry_run: bool = False) -> None:
     """Rebuild every captured interface frame's sidecar from an in-context
     upscale (see the block comment above). The first run keeps each frame's
@@ -3372,7 +3626,12 @@ def main() -> None:
     p_fonts = sub.add_parser("hd-fonts", help="Glyph sidecars for the vanilla bitmap fonts, rendered from fonts/vanilla/ TTFs in each glyph's own cell")
     p_fonts.add_argument("--only", default=None, help="Only fonts whose path contains this text")
 
-    p_outer = sub.add_parser("hd-outer-smooth", help="Smooth serrated outer silhouettes (OUTER_SMOOTH)")
+    p_stext = sub.add_parser("hd-splash-text", help="Redo the splashes' Loading Arcanum lettering (SPLASH_TEXT)")
+    p_stext.add_argument("--only", default=None)
+    p_faces = sub.add_parser("hd-font-faces", help="MAIN_FONT at HD with its own advances and kerning (hd/<art>/face.txt + face/)")
+    p_faces.add_argument("--only", default=None)
+
+    p_outer = sub.add_parser("hd-outer-smooth",help="Smooth serrated outer silhouettes (OUTER_SMOOTH)")
     p_outer.add_argument("--only", default=None)
     p_frame = sub.add_parser("hd-frame-smooth", help="Round off wobbly gold panel frames (FRAME_SMOOTH)")
     p_frame.add_argument("--only", default=None)
@@ -3469,6 +3728,12 @@ def main() -> None:
 
     if args.command == "hd-fonts":
         cmd_hd_fonts(args.only)
+        return
+    if args.command == "hd-splash-text":
+        cmd_hd_splash_text(args.only)
+        return
+    if args.command == "hd-font-faces":
+        cmd_hd_font_faces(args.only)
         return
     if args.command == "hd-lens-corners":
         cmd_hd_lens_corners(args.only)
