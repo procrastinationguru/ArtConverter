@@ -487,43 +487,60 @@ def cmd_hd_splash(force: bool = False) -> None:
 
 
 # The splashes' "Loading Arcanum..." lettering came out of the upscale
-# lumpy (#228): erased (inpainted) and typeset again. Per splash: (font,
-# variable weight or None, colour, drop shadow, cap height factor, words); a word = (text, HD
-# ink box x0, cap top, x1, baseline) measured on the upscale - the new word
-# gets that cap height and is tracked to span the same box. Words of a line
-# share the first word's size (dots have no capitals).
-SPLASH_FONT_URLS = {
-    "GoudyBookletter1911.ttf": "https://github.com/google/fonts/raw/main/ofl/goudybookletter1911/GoudyBookletter1911.ttf",
-    "CormorantGaramond[wght].ttf": "https://github.com/google/fonts/raw/main/ofl/cormorantgaramond/CormorantGaramond%5Bwght%5D.ttf",
-}
+# lumpy (#228): erased (inpainted) and drawn again. Round 8 pass 11: from
+# the vanilla lettering itself instead of a substitute font (neither Goudy
+# Bookletter nor Cormorant matched its weight/shapes) - the 1x text's
+# coverage over its background, smoothly upscaled and cut with an
+# anti-aliased threshold: the original letters with clean HD edges. Per
+# splash: (drop shadow, lines of words); a word = (text, HD ink box x0, cap
+# top or None, x1, baseline) on the upscale - where to erase and where the
+# 1x coverage is read. "..." words get identical dots (a copy of their
+# median dot); SPLASH_EVEN_WEIGHT words get every letter's stroke width
+# evened out to the word's median (Splash2's NUM read heavier than ARCA).
 SPLASH_TEXT = {
-    # Splash1's lower case is small for its capitals (x/cap 0.47, Goudy's
-    # 0.62): capitals 0.88 of the old ones, between the two.
-    "Splash1": ("GoudyBookletter1911.ttf", None, (225, 221, 212), True, 0.88, [
+    "Splash1": (True, [
         [("Loading", 1825, 1340, 2192, 1421), ("Arcanum", 2224, 1338, 2631, 1421), ("...", 2648, None, 2732, 1421)],
     ]),
-    "Splash2": ("CormorantGaramond[wght].ttf", 500, (215, 213, 210), False, 1.0, [
+    "Splash2": (False, [
         [("Loading", 2121, 1171, 2436, 1219)],
         [("ARCANUM", 2236, 1264, 2672, 1315), ("...", 2689, None, 2744, 1315)],
     ]),
-    "Splash3": ("CormorantGaramond[wght].ttf", 500, (208, 212, 205), False, 1.0, [
+    "Splash3": (False, [
         [("Loading", 106, 83, 407, 131), ("Arcanum", 475, 84, 805, 131), ("...", 821, None, 872, 131)],
     ]),
 }
+SPLASH_EVEN_WEIGHT = {"Splash2": ["ARCANUM"]}
+SPLASH_INK_SHARPNESS = 10  # sigmoid slope on the upscaled coverage (AA width)
 
 
 SPLASH_GRAIN_SHIFT = 140  # HD rows: where the grain for a textured fill comes from (above)
+
+
+def _splash_word_box(word: tuple, H: int, W: int) -> tuple[slice, slice]:
+    _, x0, top, x1, base = word
+    y0 = (top if top is not None else base - 60) - 16
+    y1 = base + 50  # descenders
+    return slice(max(0, y0), min(H, y1)), slice(max(0, x0 - 24), min(W, x1 + 16))
+
+
+def _stroke_width(ink: np.ndarray) -> float:
+    """Mean stroke width of a soft (0..1) letter: 2 x area / perimeter (a
+    stroke of length L and width w has area L w and perimeter ~2 L), with
+    the perimeter as the ink's total variation - sub-pixel, unlike a
+    distance transform's whole-pixel steps."""
+    gy, gx = np.gradient(ink)
+    perimeter = float(np.hypot(gx, gy).sum())
+    return 2.0 * float(ink.sum()) / perimeter if perimeter > 0 else 0.0
 
 
 def cmd_hd_splash_text(only: str | None = None) -> None:
     """See SPLASH_TEXT. Rebuilt from work/_splash_text_originals/ (the
     upscale, kept on the first run) every time."""
     import cv2
-    from PIL import ImageDraw, ImageFilter, ImageFont
     from scipy import ndimage
 
-    FONT_URLS.update(SPLASH_FONT_URLS)
-    for stem, (ttf, weight, colour, shadow, cap_k, lines) in SPLASH_TEXT.items():
+    k = SPLASH_INK_SHARPNESS
+    for stem, (shadow, lines) in SPLASH_TEXT.items():
         if only is not None and only.lower() not in stem.lower():
             continue
         dest = config.HD_OVERLAY_DIR / "splash" / f"{stem}_hd.bmp"
@@ -533,6 +550,9 @@ def cmd_hd_splash_text(only: str | None = None) -> None:
             shutil.copyfile(dest, backup)
         img = np.asarray(Image.open(backup).convert("RGB")).copy()
         H, W = img.shape[:2]
+        van = np.asarray(Image.open(config.SPLASH_DIR / f"{stem}.bmp").convert("RGB")).astype(np.float32)
+        s = W // van.shape[1]
+        words = [w for line in lines for w in line]
 
         # erase: the ink around every word, grown a bit - on black anything
         # a little lighter than the box's surroundings (the dim anti-aliased
@@ -541,63 +561,112 @@ def cmd_hd_splash_text(only: str | None = None) -> None:
         mask = np.zeros((H, W), bool)
         lum = img.mean(axis=2)
         sat = img.max(axis=2).astype(int) - img.min(axis=2)
-        for line in lines:
-            for _, x0, top, x1, base in line:
-                y0 = (top if top is not None else base - 60) - 16
-                y1 = base + 50  # descenders
-                box = (slice(max(0, y0), min(H, y1)), slice(max(0, x0 - 24), min(W, x1 + 16)))
-                ring = np.concatenate([lum[box][0], lum[box][-1], lum[box][:, 0], lum[box][:, -1]])
-                if not shadow:  # plain black
-                    mask[box] |= (lum[box] > np.median(ring) + 22) & (sat[box] < 80)
-                else:
-                    mask[box] |= (lum[box] > 150) & (sat[box] < 50)
+        for word in words:
+            box = _splash_word_box(word, H, W)
+            ring = np.concatenate([lum[box][0], lum[box][-1], lum[box][:, 0], lum[box][:, -1]])
+            if not shadow:  # plain black
+                mask[box] |= (lum[box] > np.median(ring) + 22) & (sat[box] < 80)
+            else:
+                mask[box] |= (lum[box] > 150) & (sat[box] < 50)
         mask = ndimage.binary_dilation(mask, iterations=7)
         filled = cv2.inpaint(np.ascontiguousarray(img[..., ::-1]), mask.astype(np.uint8) * 255, 9, cv2.INPAINT_TELEA)[..., ::-1].astype(np.float32)
         if shadow:  # textured scene: the smooth fill gets the grain of the ground above
             up = np.roll(img, SPLASH_GRAIN_SHIFT, axis=0).astype(np.float32)
             filled += up - ndimage.gaussian_filter(up, (4, 4, 0))
         m = ndimage.gaussian_filter(mask.astype(np.float32), 1.5)[..., None]
-        img = np.clip(img * (1 - m) + filled * m + 0.5, 0, 255).astype(np.uint8)
+        out = img * (1 - m) + filled * m
 
-        def load(size: float):
-            font = ImageFont.truetype(str(ensure_font(ttf)), size)
-            if weight is not None:
-                font.set_variation_by_axes([weight])
-            return font
+        # the vanilla lettering's coverage (0 background .. 1 letter colour)
+        vl = van.mean(axis=2)
+        vs = van.max(axis=2) - van.min(axis=2)
+        cov = np.zeros(vl.shape, np.float32)
+        fg = []
+        for word in words:
+            by, bx = _splash_word_box(word, H, W)
+            vb = (slice(by.start // s, by.stop // s + 1), slice(bx.start // s, bx.stop // s + 1))
+            reg = vl[vb]
+            ring = np.concatenate([reg[0], reg[-1], reg[:, 0], reg[:, -1]])
+            bg, top = np.median(ring), np.percentile(reg, 99)
+            c = np.clip((reg - bg - 6) / max(1.0, top - bg - 6), 0, 1)
+            if shadow:  # textured: only the grey, bright letters
+                c = c * (vs[vb] < 60)
+            cov[vb] = np.maximum(cov[vb], c)
+            fg.append(van[vb][c > 0.9])
+        colour = np.concatenate(fg).mean(axis=0)
 
-        ink = Image.new("L", (W, H), 0)
-        draw = ImageDraw.Draw(ink)
-        for line in lines:
-            size = None
-            for text, x0, top, x1, base in line:
-                if size is None:
-                    cap = (base - top) * cap_k
-                    size = cap * 1.5
-                    for _ in range(4):  # cap height -> size
-                        b = load(size).getbbox("H", anchor="ls")
-                        size *= cap / max(1, b[3] - b[1])
-                font = load(size)
-                advs = [font.getlength(c) for c in text]
-                first = font.getbbox(text[0], anchor="ls")
-                last = font.getbbox(text[-1], anchor="ls")
+        big = np.asarray(Image.fromarray(cov, "F").resize((W, H), Image.BICUBIC))
+        big = ndimage.gaussian_filter(big, 1.2)
+        thresh = np.full((H, W), 0.5, np.float32)
 
-                def span(t: float) -> float:
-                    return sum(advs[:-1]) + t * (len(text) - 1) + last[2] - first[0]
+        # even stroke weight: a letter heavier than the word's median gets
+        # the (higher) threshold that thins it to the median; lighter ones
+        # are left alone
+        def soft(b: np.ndarray, t: float) -> np.ndarray:
+            return 1 / (1 + np.exp(-(b - t) * k))
 
-                track = (x1 - x0 - span(0.0)) / max(1, len(text) - 1)
-                pen = x0 - first[0]
-                for c, adv in zip(text, advs):
-                    draw.text((pen, base), c, font=font, fill=255, anchor="ls")
-                    pen += adv + track
-            print(f"  {stem}: {' '.join(w[0] for w in line)} at {size:.1f}px")
+        for word in words:
+            if word[0] not in SPLASH_EVEN_WEIGHT.get(stem, []):
+                continue
+            box = _splash_word_box(word, H, W)
+            sub = big[box]
+            # a letter = parts within 12 HD px of each other (M's strokes
+            # come apart at its thin joins)
+            labels, n = ndimage.label(ndimage.binary_dilation(sub > 0.5, iterations=6))
+            regions = [labels == i for i in range(1, n + 1) if ((labels == i) & (sub > 0.5)).sum() > 200]
+            widths = [_stroke_width(soft(sub, 0.5) * r) for r in regions]
+            target = float(np.median(widths))
+            for region, width in zip(regions, widths):
+                x = np.nonzero(region)[1].mean() + box[1].start
+                if width <= target * 1.03:
+                    print(f"  {stem} {word[0]}: letter at x {x:.0f} width {width:.2f} (target {target:.2f}) kept")
+                    continue
+                best = min(np.arange(0.5, 0.85, 0.01), key=lambda t: abs(_stroke_width(soft(sub, t) * region) - target))
+                thresh[box][region] = best
+                print(f"  {stem} {word[0]}: letter at x {x:.0f} width {width:.2f} -> "
+                      f"{_stroke_width(soft(sub, best) * region):.2f} (t {best:.2f}, target {target:.2f})")
+            thresh[box] = ndimage.gaussian_filter(thresh[box], 4)  # no step between letters
 
-        out = Image.fromarray(np.ascontiguousarray(img), "RGB")
+        ink = 1 / (1 + np.exp(-(big - thresh) * k))
+        ink[big < 0.08] = 0
+
+        # identical dots: every dot of a "..." word replaced by its median
+        # dot, on one shared centre line
+        for word in words:
+            if word[0] != "...":
+                continue
+            box = _splash_word_box(word, H, W)
+            pad = 6
+            sub = np.pad(ink[box], 3 * pad)  # room for the copies near the box edge
+            labels, n = ndimage.label(sub > 0.5)
+            # only blobs inside the word's own x-range (the box margin can
+            # hold the previous letter's tail)
+            first_x = word[1] - box[1].start + 3 * pad
+            dots = [(labels == i) for i in range(1, n + 1)
+                    if (labels == i).sum() > 20 and np.nonzero(labels == i)[1].mean() >= first_x - 4]
+            if len(dots) < 2:
+                continue
+            areas = [d.sum() for d in dots]
+            tmpl_i = int(np.argsort(areas)[len(areas) // 2])
+            ys, xs = np.nonzero(dots[tmpl_i])
+            ty0, ty1, tx0, tx1 = ys.min() - pad, ys.max() + pad + 1, xs.min() - pad, xs.max() + pad + 1
+            tmpl = sub[ty0:ty1, tx0:tx1] * ndimage.binary_dilation(dots[tmpl_i], iterations=pad)[ty0:ty1, tx0:tx1]
+            tcy, tcx = ys.mean() - ty0, xs.mean() - tx0
+            cy = float(np.median([np.nonzero(d)[0].mean() for d in dots]))
+            new_sub = sub * ~ndimage.binary_dilation(np.any(dots, axis=0), iterations=pad)
+            for d in dots:
+                cx = np.nonzero(d)[1].mean()
+                oy, ox = int(round(cy - tcy)), int(round(cx - tcx))
+                h, w = tmpl.shape
+                new_sub[oy:oy + h, ox:ox + w] = np.maximum(new_sub[oy:oy + h, ox:ox + w], tmpl)
+            ink[box] = new_sub[3 * pad:-3 * pad, 3 * pad:-3 * pad]
+            print(f"  {stem}: {len(dots)} dots -> copies of dot {tmpl_i + 1}")
+
         if shadow:
-            sh = ink.filter(ImageFilter.GaussianBlur(3)).point(lambda v: int(v * 0.7))
-            out.paste((0, 0, 0), (3, 3), sh)
-        out.paste(colour, (0, 0), ink)
-        out.save(dest, "BMP")
-        print(f"{stem}: lettering redone -> {dest.name}")
+            sh = np.roll(np.roll(ndimage.gaussian_filter(ink, 3) * 0.7, 3, 0), 3, 1)[..., None]
+            out = out * (1 - sh)
+        out = out * (1 - ink[..., None]) + colour * ink[..., None]
+        Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8), "RGB").save(dest, "BMP")
+        print(f"{stem}: lettering redone from the vanilla shapes -> {dest.name}")
 
 
 def cmd_hd_portraits(force: bool = False) -> None:
@@ -2307,7 +2376,7 @@ REMACRI_SMALL = (
     "Follow_Scroll_up_OFF FollowerCycleLeft FollowerCycleRight MPCycleLeftButton "
     "MPCycleRightButton M_UpBut M_DnBut MultiPlay_UP MultiPlay_DWN Cursor_UP "
     "Cursor_DWN BookmarkButt UnBookmarkButt PrivMes_ClsBut EndTurn_But "
-    "MPly_AddBut MPly_KickBut MPRefreshButton "
+    "MPly_AddBut MPly_KickBut MPRefreshButton FateBut "
     # B
     "MM_Chest MM_Cross MM_Loc MM_LocNew MM_Note MM_Ques MM_Skull MM_WayP "
     "MMB_Chest MMB_Note MMB_Ques MMB_Skull AP_Green AP_Orange AP_Red "
@@ -2418,7 +2487,9 @@ FONT_TTF = {
     # alias (like SchemDescFont/LogbookFont) rather than a MAIN_FONT_ARTS
     # entry, which would apply 400 everywhere Flare12Font.ART is used.
     "art/interface/SaveLoadListFont.ART": ("Outfit[wght].ttf", 500),
-    "art/interface/CharStatsFont.ART": ("Outfit[wght].ttf", 500),
+    # CharStatsFont: drawn as a face (FACE_EXTRA_ARTS, round 8 pass 11 #65);
+    # this cell fit only backs the 1x/fallback glyphs.
+    "art/interface/CharStatsFont.ART": ("Outfit[wght].ttf", 400),
     "art/interface/ClarendonBLK18Font.ART": ("Coustard-Black.ttf", None),
     "art/interface/Cloister18Font.ART": ("CloisterBlack.ttf", None),
     "art/interface/Comic12Font.ART": ("comic.ttf", None),
@@ -2733,6 +2804,161 @@ LENS_RINGS = {
 }
 
 
+# Inventory-panel lenses (inven_ui.c: Lns_Papr over PDoll at (11, 9),
+# Lns_Bart / Lns_Loot over Barter / Loot at (16, 17)): the ring is half in
+# the panel (outside the 89x89 box) and half in the lens art's corners, and
+# the two were upscaled separately - two rings that don't meet, and a square
+# seam around the box (round 8 pass 11 #35). The vanilla panel + lens
+# composite around the box is upscaled once (LENS_CONTEXT_MARGIN 1x px of
+# context); the lens sidecar's colour becomes that upscale's box (its alpha
+# - the analytic hole, LENS_RINGS - is kept) and the panel sidecar gets the
+# upscale around the box, feathered into its own pixels over the outer
+# LENS_CONTEXT_FEATHER 1x px of the margin. Originals: work/_lens_context_originals/.
+LENS_CONTEXT = [
+    ("PDoll", "Lns_Papr", 11, 9),
+    ("Barter", "Lns_Bart", 16, 17),
+    ("Barter_Follower", "Lns_Bart", 16, 17),
+    ("Loot", "Lns_Loot", 16, 17),
+]
+LENS_CONTEXT_MARGIN = 20
+LENS_CONTEXT_FEATHER = 8
+
+
+def cmd_hd_lens_context(only: str | None = None) -> None:
+    stage = config.WORK_DIR / "_lens_context"
+    stage.mkdir(parents=True, exist_ok=True)
+    s = HD_SCALE
+    m = LENS_CONTEXT_MARGIN
+    lens_done: set[str] = set()
+    for panel, lens, lx, ly in LENS_CONTEXT:
+        if only is not None and only.lower() not in (panel + lens).lower():
+            continue
+        prel, lrel = f"art/interface/{panel}.ART", f"art/interface/{lens}.ART"
+        ppath, lpath = hd_out_dir(prel) / "r0_f0.png", hd_out_dir(lrel) / "r0_f0.png"
+        if not ppath.exists() or not lpath.exists():
+            print(f"{panel}/{lens}: no sidecar, skipped")
+            continue
+        for path in (ppath, lpath):
+            backup = config.WORK_DIR / "_lens_context_originals" / path.parent.name / path.name
+            if not backup.exists():
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, backup)
+
+        def vanilla(rel: str) -> tuple[np.ndarray, np.ndarray]:
+            wd = cmd_unpack(rel, quiet=True)
+            bmp = sorted(wd.glob("*_0.bmp"))[0]
+            w, h = read_bmp_dims(bmp)
+            h = abs(h)
+            idx = np.asarray(read_bmp_indices(bmp), dtype=np.uint8).reshape(h, w)
+            pal = np.asarray(read_bmp_palette(bmp), dtype=np.uint8).reshape(256, 3)
+            return pal[idx], idx == 0
+
+        prgb, pkey = vanilla(prel)
+        lrgb, lkey = vanilla(lrel)
+        comp = prgb.copy()
+        key = pkey.copy()
+        box = comp[ly:ly + lrgb.shape[0], lx:lx + lrgb.shape[1]]
+        box[~lkey] = lrgb[~lkey]
+        key[ly:ly + lrgb.shape[0], lx:lx + lrgb.shape[1]] &= lkey
+        # keyed holes (Loot, Barter_Follower) would bleed their key colour
+        # into the ring
+        comp = np.clip(inpaint_colorkey(comp, key), 0, 255).astype(np.uint8)
+        x0, y0 = max(0, lx - m), max(0, ly - m)
+        x1, y1 = min(comp.shape[1], lx + lrgb.shape[1] + m), min(comp.shape[0], ly + lrgb.shape[0] + m)
+        crop = comp[y0:y1, x0:x1]
+        src_png, hd_png = stage / f"{panel}.png", stage / f"{panel}_x4.png"
+        Image.fromarray(np.ascontiguousarray(crop), "RGB").save(src_png)
+        run_esrgan(src_png, hd_png, config.REALESRGAN_MODEL)
+        up = np.asarray(load_and_validate(hd_png, (crop.shape[1] * s, crop.shape[0] * s), "hd-lens-context")
+                        .convert("RGB")).astype(np.float32)
+        corr = structural_corr(crop, np.asarray(Image.fromarray(up.astype(np.uint8)).resize(crop.shape[1::-1], Image.BOX)))
+        if corr < BATCH_OUTPUT_MIN_CORR:
+            raise RuntimeError(f"{panel}: upscale doesn't match its source (corr {corr:.2f})")
+
+        # the panel: the upscale around the box, feathered at the margin's
+        # outer edge (image borders count as inside)
+        pan = np.asarray(Image.open(config.WORK_DIR / "_lens_context_originals" / ppath.parent.name / ppath.name)
+                         .convert("RGBA")).astype(np.float32)
+        hh, ww = up.shape[:2]
+        yy, xx = np.mgrid[0:hh, 0:ww].astype(np.float32) + 0.5
+        f = LENS_CONTEXT_FEATHER * s
+        dl = xx if x0 > 0 else np.full_like(xx, f)
+        dt = yy if y0 > 0 else np.full_like(yy, f)
+        dr = ww - xx if x1 < prgb.shape[1] else np.full_like(xx, f)
+        db = hh - yy if y1 < prgb.shape[0] else np.full_like(yy, f)
+        wgt = np.clip(np.minimum(np.minimum(dl, dr), np.minimum(dt, db)) / f, 0, 1)[..., None]
+        region = pan[y0 * s:y1 * s, x0 * s:x1 * s, :3]
+        pan[y0 * s:y1 * s, x0 * s:x1 * s, :3] = region * (1 - wgt) + up * wgt
+        Image.fromarray(np.clip(pan + 0.5, 0, 255).astype(np.uint8), "RGBA").save(ppath)
+
+        # the lens: colour from the upscale's box, its own (analytic) alpha
+        if lens not in lens_done:
+            lens_done.add(lens)
+            la = np.asarray(Image.open(config.WORK_DIR / "_lens_context_originals" / lpath.parent.name / lpath.name)
+                            .convert("RGBA")).copy()
+            bx, by = (lx - x0) * s, (ly - y0) * s
+            la[..., :3] = np.clip(up[by:by + la.shape[0], bx:bx + la.shape[1]] + 0.5, 0, 255).astype(np.uint8)
+            Image.fromarray(la, "RGBA").save(lpath)
+        print(f"{panel}/{lens}: ring upscaled in context (corr {corr:.2f})")
+
+
+# Round 8 pass 12 (#41): the character sheet's HP/fatigue -/+ buttons used
+# the stat ovals' Char_Minus/Char_Plus (their own brass bezel, not the olive
+# knobs painted beside the heart/cross circles). The engine now draws
+# Char_HTFTMinus/Plus (770/771, 21x21, unused in vanilla) there instead;
+# their HD sidecars are the panel's own knob (Char_Maint, HP row, cut to its
+# disc) with the red sign of the matching Char_Minus/Char_Plus frame on it.
+# name -> (sign art, 1x box x on Char_Maint, knob centre in the HD box).
+HTFT_KNOBS = {
+    "Char_HTFTMinus": ("Char_Minus", 408, (46.0, 44.4)),
+    "Char_HTFTPlus": ("Char_Plus", 464, (43.8, 44.2)),
+}
+HTFT_KNOB_Y = 143      # 1x box y (HP row; the fatigue row's knobs match)
+HTFT_KNOB_RADIUS = 33.0  # HD px, the knob's outer brass edge
+# frame -> sign frame drawn (vanilla: 0 up, 1 down, 2 hover, 3 disabled);
+# the pressed one is the bold hover sign brightened (its own glow frame
+# doubled on the knob), disabled is the bare knob.
+HTFT_SIGN_FRAMES = {0: (0, 1.0), 1: (2, 1.3), 2: (2, 1.0), 3: None}
+
+
+def cmd_hd_htft_knob(only: str | None = None) -> None:
+    root = config.HD_OVERLAY_DIR / "art" / "interface"
+    s = 4
+    bg = np.asarray(Image.open(root / "Char_Maint" / "r0_f0.png").convert("RGB")).astype(np.float32)
+    for name, (sign_art, bx, (kx, ky)) in HTFT_KNOBS.items():
+        if only is not None and only.lower() not in name.lower():
+            continue
+        size = 21 * s
+        crop = bg[HTFT_KNOB_Y * s:HTFT_KNOB_Y * s + size, bx * s:bx * s + size]
+        yy, xx = np.mgrid[0:size, 0:size]
+        alpha = np.clip((HTFT_KNOB_RADIUS - np.hypot(xx - kx, yy - ky)) / 2.0 + 0.5, 0, 1)
+        for frame, sign in HTFT_SIGN_FRAMES.items():
+            out = crop.copy()
+            if sign is not None:
+                sf, gain = sign
+                im = np.asarray(Image.open(root / sign_art / f"r0_f{sf}.png").convert("RGBA")).astype(np.float32)
+                red = im[..., 0] - (im[..., 1] + im[..., 2]) / 2
+                w = np.clip((red - 50) / 70, 0, 1) * (im[..., 3] / 255)
+                c = (im.shape[1] - 1) / 2
+                iy, ix = np.mgrid[0:im.shape[0], 0:im.shape[1]]
+                w *= np.hypot(ix - c, iy - c) < 24  # the sign, not the bezel's tints
+                ys, xs = np.nonzero(w > 0.5)
+                oy, ox = int(round(ky - ys.mean())), int(round(kx - xs.mean()))
+                rgb = np.clip(im[..., :3] * gain, 0, 255)
+                for y, x in zip(*np.nonzero(w > 0)):
+                    ty, tx = y + oy, x + ox
+                    if 0 <= ty < size and 0 <= tx < size:
+                        out[ty, tx] = out[ty, tx] * (1 - w[y, x]) + rgb[y, x] * w[y, x]
+            dest = root / name / f"r0_f{frame}.png"
+            backup = config.WORK_DIR / "_htft_originals" / name / dest.name
+            if dest.exists() and not backup.exists():
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(dest, backup)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(np.dstack([out, alpha * 255]).clip(0, 255).astype(np.uint8), "RGBA").save(dest)
+        print(f"{name}: knob + {sign_art} sign -> {root / name}")
+
+
 def _fit_circle(ex: np.ndarray, ey: np.ndarray) -> tuple[float, float]:
     """Algebraic circle fit (x^2 + y^2 + D x + E y + F = 0) -> centre."""
     m = np.stack([ex, ey, np.ones_like(ex)], 1)
@@ -2837,6 +3063,10 @@ def lens_ring_alpha(rgba: np.ndarray, pct: float = 50) -> tuple[np.ndarray, floa
 # name -> (centre x, centre y, radius) in vanilla px.
 DISC_MASKS = {
     "lilgrnbut": (10.625, 11.125, 11.0),  # HUD fate / sleep buttons in IntTop
+    # Loot window's take-all button: its own blotchy dark wood recess stood
+    # out on Loot_PD's plain HD wood (round 8 pass 11 #13) - keep the gold
+    # ring (outer r ~18.4) plus a thin shadow.
+    "TakeAllButt": (24.3125, 24.125, 19.0),
 }
 
 
@@ -2858,6 +3088,175 @@ def cmd_hd_disc_mask(only: str | None = None) -> None:
             a[..., 3] *= np.clip((r * HD_SCALE - d) / 2 + 0.5, 0, 1)
             Image.fromarray(np.clip(a + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / src.name)
         print(f"{name}: disc mask r={r} at ({cx}, {cy})")
+
+
+# Schematic drawings (rules/schematic.mes "Drawing" entries) fill
+# Schematic_Base's transparent hole at (240, 146) exactly. Each has its own
+# copy of the paper, whose tone never quite matches the base's around the
+# hole - a hard colour step along the drawing's edges (round 8 pass 11 #15,
+# vanilla has it too). The base is shared, so each drawing is corrected
+# instead. Target tone: the base paper around the hole (SCHEM_TONE_BAND HD
+# px deep per side, smoothed along the edge; only a few rows of paper below
+# the hole before the torn edge) filled harmonically (Laplace) across the
+# hole. The drawing's own paper tone: a wide normalized blur over its paper
+# pixels only (the drawn object and grid lines masked out). The difference
+# is added to every pixel - edges meet the base, and the drawing's own
+# brighter middle follows the surrounding paper too (pass 11 #37: "inner
+# rect a little brighter"). RGB only, low-frequency, so detail is kept. Alpha is forced
+# opaque: the eight SchemTitle_* pages had ~230 alpha on their last row and
+# column, which showed the black behind the hole as a thin frame.
+# Originals are kept in work/_schem_originals/ and always used as the input.
+SCHEM_HOLE = (240, 146)
+SCHEM_TONE_BAND = {"left": 40, "right": 40, "top": 40, "bottom": 8}
+SCHEM_TONE_SIGMA = 40
+SCHEM_TONE_GRID = 8  # Laplace fill solved on a 1/8 grid, then upsampled
+SCHEM_TONE_RAMP = 160
+
+
+def _schematic_drawing_arts() -> list[str]:
+    import re
+    mes = None
+    names = None
+    for root in config.EXTRACTED_DAT_ROOTS:
+        if mes is None and (root / "rules" / "schematic.mes").exists():
+            mes = (root / "rules" / "schematic.mes").read_text(encoding="latin-1")
+        if names is None and (root / "art" / "interface" / "interface.mes").exists():
+            names = dict((int(a), b) for a, b in re.findall(
+                r"\{(\d+)\}\{([^}]*)\}", (root / "art" / "interface" / "interface.mes").read_text(encoding="latin-1")))
+    # entry base + 2 is the drawing's interface art number (SCHEMATIC_F_ART_NUM)
+    arts = set()
+    for num, value in re.findall(r"\{(\d+)\}\{(\d+)\}", mes):
+        if int(num) % 10 == 2 and int(value) in names:
+            arts.add(names[int(value)].rsplit(".", 1)[0])
+    return sorted(arts)
+
+
+def _harmonic_fill(left: np.ndarray, right: np.ndarray, top: np.ndarray, bottom: np.ndarray,
+                   gh: int, gw: int, rows: np.ndarray, cols: np.ndarray) -> np.ndarray:
+    """(gh, gw, 3) grid whose border is the four edge profiles (sampled at
+    rows/cols) and whose interior is their Laplace (harmonic) fill."""
+    field = np.zeros((gh, gw, 3), np.float32)
+    field[:, 0] = left[rows]
+    field[:, -1] = right[rows]
+    field[0, :] = top[cols]
+    field[-1, :] = bottom[cols]
+    for cy, cx in ((0, 0), (0, -1), (-1, 0), (-1, -1)):
+        field[cy, cx] = (field[cy, cx] + (left if cx == 0 else right)[rows[cy]]) / 2
+    inner = field[1:-1, 1:-1]
+    inner[:] = np.concatenate([field[[0, -1]].reshape(-1, 3), field[:, [0, -1]].reshape(-1, 3)]).mean(axis=0)
+    for _ in range(4000):
+        inner[:] = (field[:-2, 1:-1] + field[2:, 1:-1] + field[1:-1, :-2] + field[1:-1, 2:]) / 4
+    return field
+
+
+# Round 8 pass 12 (#40, "tiny black frame" around the schematic drawings):
+# Schematic_Base's hole for the drawing (1x 240,146 295x225) has a 1-HD-px
+# ring of alpha ~200 just outside the drawing's rect, which the black under
+# the window showed through. Made opaque (its colour is already the paper's).
+SCHEM_BASE_HOLE = (240, 146, 295, 225)
+
+
+def cmd_hd_schem_base_edge() -> None:
+    path = config.HD_OVERLAY_DIR / "art" / "interface" / "Schematic_Base" / "r0_f0.png"
+    im = np.asarray(Image.open(path).convert("RGBA")).copy()
+    s = im.shape[1] // 800
+    x, y, w, h = (v * s for v in SCHEM_BASE_HOLE)
+    ring = np.zeros(im.shape[:2], bool)
+    ring[y - 3:y + h + 3, x - 3:x + w + 3] = True
+    ring[y:y + h, x:x + w] = False  # under the drawing: left alone
+    fixed = ring & (im[..., 3] < 255)
+    im[fixed, 3] = 255
+    Image.fromarray(im, "RGBA").save(path)
+    print(f"Schematic_Base: {int(fixed.sum())} hole-edge px made opaque")
+
+
+def cmd_hd_schem_tone(only: str | None = None) -> None:
+    from scipy import ndimage
+
+    base = np.asarray(Image.open(hd_out_dir("art/interface/Schematic_Base.ART") / "r0_f0.png")
+                      .convert("RGBA")).astype(np.float32)
+    x0, y0 = SCHEM_HOLE[0] * HD_SCALE, SCHEM_HOLE[1] * HD_SCALE
+    bl, br, bt, bb = (SCHEM_TONE_BAND[k] for k in ("left", "right", "top", "bottom"))
+    g = SCHEM_TONE_GRID
+    done = 0
+    for name in _schematic_drawing_arts():
+        if only is not None and only.lower() not in name.lower():
+            continue
+        out_dir = hd_out_dir(f"art/interface/{name}.ART")
+        if not out_dir.exists():
+            continue
+        backup = config.WORK_DIR / "_schem_originals" / name
+        if not backup.exists():
+            shutil.copytree(out_dir, backup)
+        for src in sorted(backup.glob("*.png")):
+            a = np.asarray(Image.open(src).convert("RGBA")).astype(np.float32)
+            h, w = a.shape[:2]
+            rgb = a[..., :3]
+            gh, gw = h // g + 1, w // g + 1
+            rows = np.linspace(0, h - 1, gh).astype(int)
+            cols = np.linspace(0, w - 1, gw).astype(int)
+
+            def profile(strip: np.ndarray, axis: int, mask: np.ndarray | None = None) -> np.ndarray:
+                # mean across the band (over `mask` pixels only), smoothed
+                # along the edge - a normalized blur, so masked-out stretches
+                # take their neighbours' tone
+                if mask is None:
+                    mask = np.ones(strip.shape[:2], np.float32)
+                num = (strip * mask[..., None]).sum(axis=axis)
+                den = mask.sum(axis=axis)[:, None]
+                sig = SCHEM_TONE_SIGMA
+                if den.sum() < 1:
+                    # no paper at all along this edge: plain mean
+                    num = strip.sum(axis=axis)
+                    den = np.full_like(den, strip.shape[axis])
+                for _ in range(4):
+                    n = ndimage.gaussian_filter1d(num, sig, axis=0, mode="nearest")
+                    d = ndimage.gaussian_filter1d(den, sig, axis=0, mode="nearest")
+                    if d.min() > 1e-3:
+                        break
+                    sig *= 3  # a long masked-out stretch: widen until covered
+                return n / np.maximum(d, 1e-6)
+
+            # paper: not much darker than the drawing's typical edge paper
+            lum = rgb.mean(axis=-1)
+            ring = np.concatenate([lum[:, :bl].ravel(), lum[:, w - br:].ravel(), lum[:bt].ravel(), lum[h - bb:].ravel()])
+            paper = (lum >= np.median(ring) - 30).astype(np.float32)
+
+            # target: the base paper around the hole, filled across it
+            target = _harmonic_fill(profile(base[y0:y0 + h, x0 - bl:x0, :3], 1),
+                                    profile(base[y0:y0 + h, x0 + w:x0 + w + br, :3], 1),
+                                    profile(base[y0 - bt:y0, x0:x0 + w, :3], 0),
+                                    profile(base[y0 + h:y0 + h + bb, x0:x0 + w, :3], 0), gh, gw, rows, cols)
+            # the drawing's own edges, filled the same way: its tone if it
+            # had no bulge of its own
+            flat = _harmonic_fill(profile(rgb[:, :bl], 1, paper[:, :bl]), profile(rgb[:, w - br:], 1, paper[:, w - br:]),
+                                  profile(rgb[:bt], 0, paper[:bt]), profile(rgb[h - bb:], 0, paper[h - bb:]),
+                                  gh, gw, rows, cols)
+
+            # its actual paper tone: normalized blur over all-paper cells
+            # (not the drawn object or the grid lines)
+            small = np.stack([np.asarray(Image.fromarray(rgb[..., c], "F").resize((gw, gh), Image.BOX))
+                              for c in range(3)], axis=-1)
+            wsmall = np.asarray(Image.fromarray(paper, "F").resize((gw, gh), Image.BOX))
+            wsmall = np.where(wsmall > 0.9, wsmall, 0)
+            sigma = 120 / g
+            num = ndimage.gaussian_filter(small * wsmall[..., None], (sigma, sigma, 0), mode="nearest")
+            den = ndimage.gaussian_filter(wsmall, sigma, mode="nearest")[..., None]
+            own = num / np.maximum(den, 1e-6)
+
+            # edges: exactly onto the base; inside (ramping in over
+            # SCHEM_TONE_RAMP HD px): the drawing's bulge taken out too
+            yy, xx = np.mgrid[0:gh, 0:gw].astype(np.float32)
+            edge = np.minimum(np.minimum(xx, gw - 1 - xx), np.minimum(yy, gh - 1 - yy)) * g
+            ramp = np.clip(edge / SCHEM_TONE_RAMP, 0, 1)[..., None]
+            delta = (target - flat) + ramp * (flat - own)
+            corr = np.stack([np.asarray(Image.fromarray(delta[..., c], "F").resize((w, h), Image.BILINEAR))
+                             for c in range(3)], axis=-1)
+            a[..., :3] = rgb + corr
+            a[..., 3] = 255
+            Image.fromarray(np.clip(a + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / src.name)
+        done += 1
+    print(f"schematic drawings tone-matched: {done}")
 
 
 # Near-black panel boxes turned pure black (#202: the HUD money/ammo box
@@ -3358,6 +3757,31 @@ def cmd_hd_fonts(only: str | None = None, ttf_override: tuple | None = None,
         print(f"{rel}: {len(frames)} glyphs from {ttf} at {size / ss:.1f}px x{x_scale:.2f}, {picto} pictures, {fallback} vanilla fallbacks")
 
 
+# Font arts outside MAIN_FONT_ARTS also drawn as a face (cmd_hd_font_faces):
+# their FONT_TTF face at its own advances, sized down to the vanilla line,
+# never narrowed. Per-cell fitting clamps each letter to its vanilla cell
+# (_fit_glyph's gw = min(cw, ...)), which still squeezed wide letters.
+# Round 8 pass 11: CharStatsFont (#65, "just Outfit 400" - its alias source
+# is blackletter morph15font), CasablancaAntique30Font (#71, the schematic
+# name header in Special Elite), SchemDescFont (#31, its body text).
+FACE_EXTRA_ARTS = [
+    "art/interface/CharStatsFont.ART",
+    "art/interface/CasablancaAntique30Font.ART",
+    # pass 11 (#31): the body text too after all - per-cell fitting left gaps
+    # after wide letters ("w onders", "fro m") next to the face header
+    "art/interface/SchemDescFont.ART",
+    # pass 12 (#46): the Save/Load list's bold names - per-cell fitting into
+    # Flare12Font's narrow cells squeezed Outfit 500's capitals together
+    "art/interface/SaveLoadListFont.ART",
+]
+
+# Extra size factor on a face's matched size (cmd_hd_font_faces), baseline
+# kept. Round 8 pass 11 #18: CharStatsFont's Level/Race/... block read a
+# little large next to the rest of the character sheet.
+FACE_SIZE_SCALE = {
+    "art/interface/CharStatsFont.ART": 0.9,
+}
+
 # Text the face size is matched on (FONT_FACE): typical UI / dialogue text.
 FACE_SAMPLE = ("Having been given the strange ring by Preston Radcliffe, you are currently "
                "attempting to find its owner. Shall we trade? Could you heal me? The Discipline "
@@ -3365,7 +3789,8 @@ FACE_SAMPLE = ("Having been given the strange ring by Preston Radcliffe, you are
 
 
 def cmd_hd_font_faces(only: str | None = None) -> None:
-    """MAIN_FONT drawn as itself at HD (round 8 pass 7, #229-#236): no
+    """MAIN_FONT (and FACE_EXTRA_ARTS' FONT_TTF faces) drawn as itself at
+    HD (round 8 pass 7, #229-#236): no
     per-cell fitting - its own glyph shapes, advances and kerning. The
     engine (font.c, tig_font_hd_face) lays each line out with these HD
     advances from the vanilla line's start (or centre), so only the 1x
@@ -3379,13 +3804,8 @@ def cmd_hd_font_faces(only: str | None = None) -> None:
     from PIL import ImageDraw, ImageFont
 
     s = HD_SCALE
-    ttf, weight = MAIN_FONT[:2]
-    path = ensure_font(ttf)
-    hb_face = hb.Face(hb.Blob.from_file_path(str(path)))
-    hb_font = hb.Font(hb_face)
-    if weight is not None:
-        hb_font.set_variations({"wght": weight})
-    upem = hb_face.upem
+    hb_font = None
+    upem = 1
 
     def shape(text: str) -> list:
         buf = hb.Buffer()
@@ -3397,20 +3817,30 @@ def cmd_hd_font_faces(only: str | None = None) -> None:
     def width_em(text: str) -> float:
         return sum(p.x_advance for p in shape(text)) / upem
 
-    cap_ext = hb_font.get_glyph_extents(hb_font.get_nominal_glyph(ord("H")))
-    cap_em = -cap_ext.height / upem
-
-    for rel in MAIN_FONT_ARTS:
+    for rel in MAIN_FONT_ARTS + FACE_EXTRA_ARTS:
         if only is not None and only.lower() not in rel.lower():
             continue
-        wd = cmd_unpack(rel, quiet=True)
-        basename = Path(rel).name.rsplit(".", 1)[0]
+        ttf, weight = FONT_TTF[rel]
+        path = ensure_font(ttf)
+        hb_face = hb.Face(hb.Blob.from_file_path(str(path)))
+        hb_font = hb.Font(hb_face)
+        if weight is not None:
+            hb_font.set_variations({"wght": weight})
+        upem = hb_face.upem
+        cap_ext = hb_font.get_glyph_extents(hb_font.get_nominal_glyph(ord("H")))
+        cap_em = -cap_ext.height / upem
+
+        # an alias (FONT_ALIAS) has its source art's cells and advances
+        src_rel = FONT_ALIAS.get(rel, rel)
+        wd = cmd_unpack(src_rel, quiet=True)
+        basename = Path(src_rel).name.rsplit(".", 1)[0]
         frames = _font_frames(wd, basename)
         advances = _font_advances(wd / (basename + ".ini"))
         by_frame = {f["frame"]: f for f in frames}
         ref = _ink_box(by_frame[ord("H") - 31]["cov"])
         vw = sum(advances.get(ord(c) - 31, 0) for c in FACE_SAMPLE)
         size = min(vw / width_em(FACE_SAMPLE), (ref[3] - ref[1]) / cap_em)  # vanilla px
+        size *= FACE_SIZE_SCALE.get(rel, 1.0)
         px = size * s  # HD px per em
         baseline = ref[3] * s  # HD row of the baseline in the cell
 
@@ -3693,6 +4123,13 @@ def main() -> None:
     p_cvr.add_argument("--only", default=None)
     p_disc = sub.add_parser("hd-disc-mask", help="Cut round buttons' sidecars to their disc (DISC_MASKS)")
     p_disc.add_argument("--only", default=None)
+    p_lensc = sub.add_parser("hd-lens-context", help="Inventory/barter/loot lens rings upscaled in context with their panel (LENS_CONTEXT)")
+    p_lensc.add_argument("--only", default=None)
+    p_htft = sub.add_parser("hd-htft-knob", help="HP/fatigue -/+ sidecars from the character sheet's own knobs (HTFT_KNOBS)")
+    p_htft.add_argument("--only", default=None)
+    sub.add_parser("hd-schem-base-edge", help="Schematic_Base: opaque ring around the drawing's hole (SCHEM_BASE_HOLE)")
+    p_schem = sub.add_parser("hd-schem-tone", help="Match schematic drawings' edge tone to the base paper (SCHEM_TONE_*)")
+    p_schem.add_argument("--only", default=None)
     p_icon = sub.add_parser("hd-icon-patch", help="Re-upscale icons painted into panels with another model (ICON_PATCHES)")
     p_icon.add_argument("--only", default=None)
     p_black = sub.add_parser("hd-black-fill", help="Near-black panel boxes / icon backgrounds -> pure black (BLACK_BOXES, BLACK_BG)")
@@ -3806,6 +4243,18 @@ def main() -> None:
         return
     if args.command == "hd-disc-mask":
         cmd_hd_disc_mask(args.only)
+        return
+    if args.command == "hd-lens-context":
+        cmd_hd_lens_context(args.only)
+        return
+    if args.command == "hd-htft-knob":
+        cmd_hd_htft_knob(args.only)
+        return
+    if args.command == "hd-schem-base-edge":
+        cmd_hd_schem_base_edge()
+        return
+    if args.command == "hd-schem-tone":
+        cmd_hd_schem_tone(args.only)
         return
     if args.command == "hd-icon-patch":
         cmd_hd_icon_patch(args.only)

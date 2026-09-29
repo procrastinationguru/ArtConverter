@@ -12,4 +12,9 @@ python pipeline.py hd-fonts [--only X]        # per-glyph sidecars for all bitma
 python pipeline.py hd-font-faces [--only X]   # MAIN_FONT faces: hd/art/<font>/face.txt + face/f<N>.png (needs uharfbuzz); run after hd-fonts
 python pipeline.py hd-lens-rings              # smooth PC lens ring hole edges
 python pipeline.py hd-lens-corners            # ring corners from panel wood + LENS_ALIAS copies (Lns_Map, Lns_Schm); run after hd-lens-rings
-python pipeline.py hd-splash-text [--only X]  # re-typeset "Loading Arcanum..." on splashes (needs opencv); backup in work/_splash_text_originals
+python pipeline.py hd-splash-text [--only X]  # rebuild "Loading Arcanum..." from the vanilla letter shapes (needs opencv); backup in work/_splash_text_originals
+python pipeline.py hd-lens-context [--only X] # inventory/barter/loot lens ring upscaled in context with its panel (round 8 pass 11); run after re-upscaling those arts
+python pipeline.py hd-schem-tone [--only X]   # match schematic drawings' paper tone to Schematic_Base (pass 11); run after re-upscaling drawings
+python pipeline.py hd-schem-base-edge          # Schematic_Base: opaque ring round the drawing's hole (pass 12 #40); run after re-upscaling Schematic_Base
+python pipeline.py hd-htft-knob [--only X]    # HP/fatigue -/+ sidecars (Char_HTFTPlus/Minus) from Char_Maint's knobs + Char_Plus/Minus signs (pass 12 #41); run after re-upscaling those
+python pipeline.py hd-disc-mask [--only X]    # cut round buttons (DISC_MASKS) to their disc
