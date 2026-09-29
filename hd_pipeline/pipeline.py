@@ -509,8 +509,14 @@ SPLASH_TEXT = {
         [("Loading", 106, 83, 407, 131), ("Arcanum", 475, 84, 805, 131), ("...", 821, None, 872, 131)],
     ]),
 }
-SPLASH_EVEN_WEIGHT = {"Splash2": ["ARCANUM"]}
-SPLASH_INK_SHARPNESS = 10  # sigmoid slope on the upscaled coverage (AA width)
+# Pass 12 feedback (#51): replaced by the per-stroke evening below (every
+# word of every splash) - the per-letter one left the A's hairline leg and
+# M's diagonals thin next to their thick stems.
+SPLASH_EVEN_WEIGHT: dict[str, list[str]] = {}
+SPLASH_STROKE_GAIN = 0.25  # cut change per HD px of stroke radius off the word's median
+SPLASH_STROKE_BASE = 0.3   # coverage cut the stroke skeleton is taken from (keeps hairlines whole)
+SPLASH_STROKE_PRUNE = 2.0  # skeleton points thinner than this (HD px radius) are halo spurs
+SPLASH_INK_SHARPNESS = 16  # sigmoid slope on the upscaled coverage (AA width); was 10, soft
 
 
 SPLASH_GRAIN_SHIFT = 140  # HD rows: where the grain for a textured fill comes from (above)
@@ -604,6 +610,35 @@ def cmd_hd_splash_text(only: str | None = None) -> None:
         def soft(b: np.ndarray, t: float) -> np.ndarray:
             return 1 / (1 + np.exp(-(b - t) * k))
 
+        # Pass 12 feedback (#51, "weight consistent for all letters"): per
+        # stroke, every word - each pixel's cut is moved by the radius of
+        # its nearest stroke centre (skeleton of the coverage cut at
+        # SPLASH_STROKE_BASE, halo spurs under SPLASH_STROKE_PRUNE px
+        # dropped) against the word's median: hairlines (the A's left leg,
+        # M's diagonals) are cut lower and so thicken, heavy stems thin.
+        # not on the textured scene (Splash1): its coverage holds the ground's
+        # grain, a lower cut brought it up as specks
+        if SPLASH_STROKE_GAIN > 0 and not shadow:
+            from skimage.morphology import skeletonize
+            for word in words:
+                if word[0] == "...":
+                    continue
+                box = _splash_word_box(word, H, W)
+                sub = big[box]
+                shape = sub > SPLASH_STROKE_BASE
+                dist = ndimage.distance_transform_edt(shape)
+                skel = skeletonize(shape) & (dist >= SPLASH_STROKE_PRUNE)
+                if not skel.any():
+                    continue
+                med = float(np.median(dist[skel]))
+                radius = np.where(skel, dist, 0)
+                _, (iy, ix) = ndimage.distance_transform_edt(~skel, return_indices=True)
+                local = ndimage.median_filter(radius, size=5)[iy, ix]
+                local = np.where(local > 0, local, radius[iy, ix])
+                t = np.clip(0.5 + SPLASH_STROKE_GAIN * (local - med), 0.22, 0.8)
+                thresh[box] = ndimage.gaussian_filter(t, 3)
+                print(f"  {stem} {word[0]}: stroke radius median {med:.2f} HD px, cuts evened")
+
         for word in words:
             if word[0] not in SPLASH_EVEN_WEIGHT.get(stem, []):
                 continue
@@ -627,7 +662,7 @@ def cmd_hd_splash_text(only: str | None = None) -> None:
             thresh[box] = ndimage.gaussian_filter(thresh[box], 4)  # no step between letters
 
         ink = 1 / (1 + np.exp(-(big - thresh) * k))
-        ink[big < 0.08] = 0
+        ink[big < 0.12] = 0
 
         # identical dots: every dot of a "..." word replaced by its median
         # dot, on one shared centre line
@@ -2486,7 +2521,8 @@ FONT_TTF = {
     # mainmenu_ui.c's two save/load list+preview fonts, so a SaveLoadListFont
     # alias (like SchemDescFont/LogbookFont) rather than a MAIN_FONT_ARTS
     # entry, which would apply 400 everywhere Flare12Font.ART is used.
-    "art/interface/SaveLoadListFont.ART": ("Outfit[wght].ttf", 500),
+    # Pass 12 feedback (#47): "make save games list forced bold" - 700.
+    "art/interface/SaveLoadListFont.ART": ("Outfit[wght].ttf", 700),
     # CharStatsFont: drawn as a face (FACE_EXTRA_ARTS, round 8 pass 11 #65);
     # this cell fit only backs the 1x/fallback glyphs.
     "art/interface/CharStatsFont.ART": ("Outfit[wght].ttf", 400),
@@ -2932,7 +2968,12 @@ def cmd_hd_htft_knob(only: str | None = None) -> None:
         crop = bg[HTFT_KNOB_Y * s:HTFT_KNOB_Y * s + size, bx * s:bx * s + size]
         yy, xx = np.mgrid[0:size, 0:size]
         alpha = np.clip((HTFT_KNOB_RADIUS - np.hypot(xx - kx, yy - ky)) / 2.0 + 0.5, 0, 1)
-        for frame, sign in HTFT_SIGN_FRAMES.items():
+        # Pass 12 feedback (#60/#61, "+ moving a bit on hover"): the sign
+        # frames are registered alike, so all of them take the up frame's
+        # offset - each one centred on its own centroid moved the glowing
+        # hover sign by a few px.
+        offset = None
+        for frame, sign in sorted(HTFT_SIGN_FRAMES.items(), key=lambda kv: kv[1] is None or kv[1][0] != 0):
             out = crop.copy()
             if sign is not None:
                 sf, gain = sign
@@ -2942,8 +2983,10 @@ def cmd_hd_htft_knob(only: str | None = None) -> None:
                 c = (im.shape[1] - 1) / 2
                 iy, ix = np.mgrid[0:im.shape[0], 0:im.shape[1]]
                 w *= np.hypot(ix - c, iy - c) < 24  # the sign, not the bezel's tints
-                ys, xs = np.nonzero(w > 0.5)
-                oy, ox = int(round(ky - ys.mean())), int(round(kx - xs.mean()))
+                if offset is None:
+                    ys, xs = np.nonzero(w > 0.5)
+                    offset = (int(round(ky - ys.mean())), int(round(kx - xs.mean())))
+                oy, ox = offset
                 rgb = np.clip(im[..., :3] * gain, 0, 255)
                 for y, x in zip(*np.nonzero(w > 0)):
                     ty, tx = y + oy, x + ox
@@ -3111,6 +3154,7 @@ SCHEM_TONE_BAND = {"left": 40, "right": 40, "top": 40, "bottom": 8}
 SCHEM_TONE_SIGMA = 40
 SCHEM_TONE_GRID = 8  # Laplace fill solved on a 1/8 grid, then upsampled
 SCHEM_TONE_RAMP = 160
+SCHEM_TONE_EDGE = 6  # HD px the leftover edge tone is measured over (#49)
 
 
 def _schematic_drawing_arts() -> list[str]:
@@ -3168,6 +3212,318 @@ def cmd_hd_schem_base_edge() -> None:
     im[fixed, 3] = 255
     Image.fromarray(im, "RGBA").save(path)
     print(f"Schematic_Base: {int(fixed.sum())} hole-edge px made opaque")
+
+
+# Round 8 pass 12 feedback (#47, "why don't we have a chain there as in
+# other scroll bars"): the loot/barter scroll tracks have a gold chain painted
+# into their panels, the Save/Load list's track (SaveLoadBackground, the
+# scrollbar at 1x 213,111 12x232) is bare wood. One period (two links) of the
+# Loot panel's chain is cut out (alpha from its brightness over the black
+# track), tiled down the track between the arrow buttons with a soft shadow.
+# Idempotent: works from a backup of the original sidecar.
+SAVELOAD_CHAIN_SRC = (1336, 1364, 1040)  # Loot HD x0, x1, first row of the period
+SAVELOAD_CHAIN_PERIOD = 105  # HD rows, best pixel autocorrelation (two links)
+# art -> (1x centre x of the chain = the thumb's, 1x rows a little under
+# both arrow buttons). Pass 12 feedback #52: the character sheet's scheme
+# list (Scheme_Rot, scrollbar 209,58 17x255) too.
+# Pass 13 feedback #89: rows exactly between the arrow buttons (up arrow 15
+# rows, down arrow 14; the chain showed past the arrows' slanted sides).
+SAVELOAD_CHAIN_TARGETS = {
+    "SaveLoadBackground": (218.5, (111 + 15, 111 + 232 - 14)),
+    "Scheme_Rot": (217.5, (58 + 15, 58 + 255 - 14)),
+}
+
+
+def _scroll_chain_period():
+    """One period of the Loot panel's vanilla chain: (alpha, colour, ink columns)."""
+    backup = config.WORK_DIR / "_scroll_chain_originals" / "Loot"
+    src = backup if backup.exists() else hd_out_dir("art/interface/Loot.ART")
+    loot = np.asarray(Image.open(src / "r0_f0.png").convert("RGB")).astype(np.float32)
+    x0, x1, y = SAVELOAD_CHAIN_SRC
+    seg = loot[y:y + SAVELOAD_CHAIN_PERIOD, x0:x1]
+    alpha = np.clip((seg.max(axis=2) - 8) / 30, 0, 1)
+    color = np.clip(np.where(alpha[..., None] > 0.02, seg / np.maximum(alpha[..., None], 1e-3), 0), 0, 255)
+    ink = np.nonzero(alpha.max(axis=0) > 0.2)[0]
+    return alpha, color, ink
+
+
+def _paint_scroll_chain(bg: np.ndarray, x_c: float, y_top: int, y_bottom: int) -> tuple[int, int, int]:
+    """Tile the chain over `bg` (float RGBA, HD) centred on 1x x_c, 1x rows y_top..y_bottom."""
+    from scipy import ndimage
+
+    alpha, color, ink = _scroll_chain_period()
+    shadow_src = ndimage.gaussian_filter(alpha, 3)
+    s = HD_SCALE
+    y0, y1 = y_top * s, y_bottom * s
+    h = y1 - y0
+    reps = h // SAVELOAD_CHAIN_PERIOD + 1
+    a = np.tile(alpha, (reps, 1))[:h]
+    c = np.tile(color, (reps, 1, 1))[:h]
+    cx = int(round(x_c * s - (ink[0] + ink[-1]) / 2))
+    region = bg[y0:y1, cx:cx + a.shape[1], :3]
+    shadow = np.roll(np.tile(shadow_src, (reps, 1))[:h], (3, 3), axis=(0, 1)) * 0.6
+    region *= 1 - shadow[..., None]
+    region[:] = region * (1 - a[..., None]) + c * a[..., None]
+    return cx, y0, y1
+
+
+def cmd_hd_saveload_chain() -> None:
+    for name, (x_c, (y_top, y_bottom)) in SAVELOAD_CHAIN_TARGETS.items():
+        out_dir = hd_out_dir(f"art/interface/{name}.ART")
+        backup = config.WORK_DIR / "_saveload_originals" / name
+        if not backup.exists():
+            shutil.copytree(out_dir, backup)
+        bg = np.asarray(Image.open(backup / "r0_f0.png").convert("RGBA")).astype(np.float32)
+        cx, y0, y1 = _paint_scroll_chain(bg, x_c, y_top, y_bottom)
+        Image.fromarray(np.clip(bg, 0, 255).astype(np.uint8), "RGBA").save(out_dir / "r0_f0.png")
+        print(f"{name}: chain at x {cx}.., y {y0}..{y1}")
+
+
+# Pass 13 feedback #89: the loot/barter panels' own chains ran under both
+# arrow buttons (showing past their slanted sides) and sat ~1 1x px left of
+# the arrows' centre. The vanilla chain is painted out (each row filled with
+# the median of the track either side of it) and repainted between the
+# arrows, centred on them. Scrollbars (inven_ui.c): loot 330,136 17x256,
+# barter 330,168 17x224 (Barter_Follower = barter with cycle buttons);
+# arrows 11 wide centred in the rect, up 15 rows, down 14.
+# art -> (scrollbar y, height, HD rows holding the vanilla chain)
+SCROLL_CHAIN_PANELS = {
+    "Loot": (136, 256, (590, 1520)),
+    "Barter": (168, 224, (676, 1564)),
+    "Barter_Follower": (168, 224, (718, 1520)),
+}
+SCROLL_CHAIN_ERASE_X = (1334, 1368)  # HD columns of the vanilla chain (+ margin)
+SCROLL_CHAIN_SIDE_X = ((1316, 1330), (1370, 1384))  # clean track either side
+SCROLL_CHAIN_BAR_X = 330  # 1x, all three
+SCROLL_CHAIN_BAR_W = 17
+
+
+def cmd_hd_scroll_chains() -> None:
+    backups = config.WORK_DIR / "_scroll_chain_originals"
+    # Loot's backup first: it is the chain source for every target.
+    for name in SCROLL_CHAIN_PANELS:
+        out_dir = hd_out_dir(f"art/interface/{name}.ART")
+        if not (backups / name).exists():
+            shutil.copytree(out_dir, backups / name)
+    x_c = SCROLL_CHAIN_BAR_X + (SCROLL_CHAIN_BAR_W - 11) // 2 + 11 / 2
+    for name, (bar_y, bar_h, (ey0, ey1)) in SCROLL_CHAIN_PANELS.items():
+        out_dir = hd_out_dir(f"art/interface/{name}.ART")
+        bg = np.asarray(Image.open(backups / name / "r0_f0.png").convert("RGBA")).astype(np.float32)
+        ex0, ex1 = SCROLL_CHAIN_ERASE_X
+        (l0, l1), (r0, r1) = SCROLL_CHAIN_SIDE_X
+        side = np.concatenate([bg[ey0:ey1, l0:l1, :3], bg[ey0:ey1, r0:r1, :3]], axis=1)
+        bg[ey0:ey1, ex0:ex1, :3] = np.median(side, axis=1)[:, None, :]
+        cx, y0, y1 = _paint_scroll_chain(bg, x_c, bar_y + 15, bar_y + bar_h - 14)
+        Image.fromarray(np.clip(bg, 0, 255).astype(np.uint8), "RGBA").save(out_dir / "r0_f0.png")
+        print(f"{name}: chain erased HD rows {ey0}..{ey1}, repainted centre {x_c} (1x), x {cx}.., y {y0}..{y1}")
+
+
+# Round 8 pass 12 feedback (#48): the worldmap's bottom plate (MapMain, with
+# Nav_Cvr over its top half at 1x 294,341) has two pill frames whose dark
+# inner groove sits ~16 HD px from the outer edge at the top but ~8 at the
+# bottom. Everything inside each pill but its outer 5 HD px is moved up
+# NAV_PILL_SHIFT px, so both rims are ~12. Pills are stadiums (HD x0, y0,
+# x1, y1). Idempotent: works from backups of both sidecars.
+NAV_PILLS = [(1184, 1444, 1458, 1566), (1716, 1444, 1990, 1566)]
+NAV_PILL_SHIFT = 4
+NAV_CVR_POS = (294, 341)  # 1x, wmap_ui.c wmap_ui_nav_cvr_frame (382 - window y 41)
+
+
+# Pass 13 #62: character creation's arrow buttons (portrait Big_Grn_L/R,
+# gender/race/background MPCycleLeft/RightButton). The upscales kept the
+# vanilla's dithered checker in the lit arrows, two different reds, and the
+# big ones' clipped crescent of rim on one side. Rebuilt: one disc (frame
+# 0's, arrow inpainted) for every frame so nothing shifts on hover, vector
+# arrows (1x polygons traced from the vanilla) in shared colours, and the
+# big discs cut round and centred on CreateCharacterBase's sockets.
+# name -> (arrow polygon (1x px edges), disc mask (cx, cy, r) 1x or None,
+#          content shift (dx, dy) 1x)
+CYCLE_ARROWS = {
+    "Big_Grn_L": ([(8.0, 15.5), (14.8, 8.7), (14.8, 12.0), (22.0, 12.0), (22.0, 19.0),
+                   (14.8, 19.0), (14.8, 22.3)], (15.0, 14.8, 15.6), (0.0, -0.7)),
+    "Big_Grn_R": ([(23.0, 15.5), (16.2, 8.7), (16.2, 12.0), (9.0, 12.0), (9.0, 19.0),
+                   (16.2, 19.0), (16.2, 22.3)], (16.0, 14.8, 15.6), (1.0, -0.7)),
+    # own partial gold ring clashed with the pill's socket ring: cut inside it
+    "MPCycleLeftButton": ([(8.0, 11.5), (14.0, 5.8), (14.0, 17.2)], (11.05, 11.3, 10.4), (-0.45, -0.2)),
+    "MPCycleRightButton": ([(16.0, 11.5), (10.0, 5.8), (10.0, 17.2)], (11.85, 11.1, 10.4), (0.35, -0.4)),
+}
+# frame -> (top colour, bottom colour) of the arrow's vertical gradient
+CYCLE_ARROW_COLORS = {
+    0: ((170, 18, 36), (112, 4, 22)),    # idle
+    1: ((222, 52, 50), (160, 22, 28)),   # pressed
+    2: ((250, 84, 74), (196, 34, 36)),   # hover
+}
+
+
+def cmd_hd_cycle_arrows(only: str | None = None) -> None:
+    import cv2
+    from PIL import ImageDraw
+    from scipy import ndimage
+
+    s = HD_SCALE
+    ss = 4  # supersampling for the polygon
+    for name, (poly, disc, (dx, dy)) in CYCLE_ARROWS.items():
+        if only is not None and only.lower() not in name.lower():
+            continue
+        out_dir = hd_out_dir(f"art/interface/{name}.ART")
+        backup = config.WORK_DIR / "_cycle_arrow_originals" / name
+        if not backup.exists():
+            shutil.copytree(out_dir, backup)
+        base = np.asarray(Image.open(backup / "r0_f0.png").convert("RGBA")).astype(np.float32)
+        h, w = base.shape[:2]
+
+        # the old arrow (red-dominant pixels, grown) inpainted out of the disc
+        rgb = base[..., :3]
+        red = (rgb[..., 0] > rgb[..., 1] + 35) & (rgb[..., 0] > 60) & (base[..., 3] > 128)
+        red = ndimage.binary_dilation(red, iterations=5)
+        clean = cv2.inpaint(np.ascontiguousarray(rgb.clip(0, 255).astype(np.uint8)),
+                            red.astype(np.uint8) * 255, 8, cv2.INPAINT_TELEA).astype(np.float32)
+        disc_im = np.dstack([clean, base[..., 3]])
+
+        if dx or dy:
+            m = np.float32([[1, 0, dx * s], [0, 1, dy * s]])
+            disc_im = cv2.warpAffine(disc_im, m, (w, h), flags=cv2.INTER_LINEAR,
+                                     borderMode=cv2.BORDER_REPLICATE)
+        if disc is not None:
+            cx, cy, r = disc
+            yy, xx = np.mgrid[0:h, 0:w] + 0.5
+            d = np.hypot(xx - cx * s, yy - cy * s)
+            disc_im[..., 3] = np.minimum(disc_im[..., 3], np.clip(r * s - d + 0.5, 0, 1) * 255)
+
+        # arrow coverage, supersampled
+        big = Image.new("L", (w * ss, h * ss), 0)
+        ImageDraw.Draw(big).polygon([((x + dx) * s * ss, (y + dy) * s * ss) for x, y in poly], fill=255)
+        cov = np.asarray(big.resize((w, h), Image.LANCZOS)).astype(np.float32) / 255.0
+        ys = [(y + dy) * s for _, y in poly]
+        t = np.clip((np.arange(h)[:, None] - min(ys)) / max(1.0, max(ys) - min(ys)), 0, 1)
+        # bevel: lit along the top-left edge, shaded along the bottom-right
+        inner = ndimage.gaussian_filter(cov, 2.0)
+        gy, gx = np.gradient(inner)
+        bevel = np.clip(-(gx + gy) * 6.0, -1, 1) * cov
+        # the arrow sits in a recess: a soft dark halo under it
+        shadow = ndimage.gaussian_filter(ndimage.shift(cov, (1.5, 1.5), order=1), 2.0) * 0.55
+
+        for f, (top, bot) in CYCLE_ARROW_COLORS.items():
+            top_c, bot_c = np.array(top, np.float32), np.array(bot, np.float32)
+            col = top_c[None, None] * (1 - t[..., None]) + bot_c[None, None] * t[..., None]
+            col = col + np.where(bevel[..., None] > 0, (255 - col) * bevel[..., None] * 0.45,
+                                 col * bevel[..., None] * 0.5)
+            out = disc_im.copy()
+            out[..., :3] *= (1 - shadow[..., None])
+            out[..., :3] = out[..., :3] * (1 - cov[..., None]) + col * cov[..., None]
+            Image.fromarray(out.clip(0, 255).astype(np.uint8), "RGBA").save(out_dir / f"r0_f{f}.png")
+        print(f"{name}: disc + vector arrow, {len(CYCLE_ARROW_COLORS)} frames")
+
+
+def cmd_hd_nav_pill_rim() -> None:
+    dirs = {}
+    for name in ("MapMain", "Nav_Cvr"):
+        out_dir = hd_out_dir(f"art/interface/{name}.ART")
+        backup = config.WORK_DIR / "_nav_pill_originals" / name
+        if not backup.exists():
+            shutil.copytree(out_dir, backup)
+        dirs[name] = (out_dir, Image.open(backup / "r0_f0.png").convert("RGBA"))
+    bg = dirs["MapMain"][1]
+    nav = dirs["Nav_Cvr"][1]
+    nx, ny = NAV_CVR_POS[0] * HD_SCALE, NAV_CVR_POS[1] * HD_SCALE
+    comp = bg.copy()
+    comp.alpha_composite(nav, (nx, ny))
+    a = np.asarray(comp).copy()
+    h, w = a.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w]
+    moved = np.roll(a, -NAV_PILL_SHIFT, axis=0)
+    mask = np.zeros((h, w), bool)
+    for x0, y0, x1, y1 in NAV_PILLS:
+        x0, y0, x1, y1 = x0 + 5, y0 + 5, x1 - 5, y1 - 5
+        r = (y1 - y0) / 2
+        dx = np.maximum(np.maximum(x0 + r - xx, xx - (x1 - r)), 0)
+        mask |= dx ** 2 + (yy - (y0 + y1) / 2) ** 2 <= r * r
+    a[mask] = moved[mask]
+    out_bg = np.asarray(bg).copy()
+    out_bg[mask] = a[mask]
+    Image.fromarray(out_bg, "RGBA").save(dirs["MapMain"][0] / "r0_f0.png")
+    n = np.asarray(nav).copy()
+    nh, nw = n.shape[:2]
+    sub_mask = mask[ny:ny + nh, nx:nx + nw] & (n[..., 3] > 0)
+    n[..., :3][sub_mask] = a[ny:ny + nh, nx:nx + nw, :3][sub_mask]
+    Image.fromarray(n, "RGBA").save(dirs["Nav_Cvr"][0] / "r0_f0.png")
+    print(f"MapMain/Nav_Cvr: {int(mask.sum())} pill px moved up {NAV_PILL_SHIFT}")
+
+
+# Round 8 pass 12 feedback (#59): the charedit Skills_Window's four gauges.
+# - The glass tube (1x x 59..179, the liquid's span) only had its cylinder
+#   in HD rows 17..57 of each slot; below it the "reservoir" read as erased
+#   (near-black). Those rows are stretched over the liquid's rows 12..95
+#   (charedit draws SkilGauge rows 3..23 there), feathered into the rest.
+# - The 1..5 under it were 3-4 px blobs no model can read: each cell
+#   (24 px, dividers at 1x x 59 + 24 k, strip rows 115..122 of slot 0) has
+#   the old digit inpainted away and the digit drawn in SKILL_GAUGE_FONT,
+#   dark engraved ink with a light lower-right edge.
+# Slots are 66 px apart from y 87. Idempotent: works from a backup.
+SKILL_GAUGE_SLOTS = [87 + 66 * k for k in range(4)]
+SKILL_GAUGE_GLASS_X = (59, 179)
+SKILL_GAUGE_CELLS_X = 59
+SKILL_GAUGE_STRIP_Y = (115, 123)  # 1x rows of the wooden strip, slot 0
+SKILL_GAUGE_FONT = ("texgyrebonum-bold.otf", 26)  # HD px
+SKILL_GAUGE_INK = (58, 34, 18)
+SKILL_GAUGE_RAIL_ROWS = (86, 107)  # HD rows below each slot's top: the rail under the tube
+SKILL_GAUGE_RAIL_X = (214, 293)    # HD x: left bracket .. where the vanilla rail starts
+
+
+def cmd_hd_skill_gauge() -> None:
+    import cv2
+    from PIL import ImageDraw, ImageFont
+
+    out_dir = hd_out_dir("art/interface/Skills_Window.ART")
+    backup = config.WORK_DIR / "_skill_gauge_originals" / "Skills_Window"
+    if not backup.exists():
+        shutil.copytree(out_dir, backup)
+    s = HD_SCALE
+    im = np.asarray(Image.open(backup / "r0_f0.png").convert("RGBA")).astype(np.float32)
+    x0, x1 = SKILL_GAUGE_GLASS_X[0] * s, SKILL_GAUGE_GLASS_X[1] * s
+    font = ImageFont.truetype(str(ensure_font(SKILL_GAUGE_FONT[0])), SKILL_GAUGE_FONT[1])
+    for slot in SKILL_GAUGE_SLOTS:
+        y = slot * s
+        glass = im[y + 17:y + 57, x0:x1]
+        tall = np.asarray(Image.fromarray(glass.astype(np.uint8), "RGBA")
+                          .resize((x1 - x0, 95 - 12), Image.BICUBIC)).astype(np.float32)
+        rows = np.arange(12, 95)
+        cols = np.arange(x0, x1)
+        w = (np.clip(np.minimum(rows - 12, 94 - rows) / 4.0, 0, 1)[:, None, None]
+             * np.clip(np.minimum(cols - x0, x1 - 1 - cols) / 6.0, 0, 1)[None, :, None])
+        im[y + 12:y + 95, x0:x1] = im[y + 12:y + 95, x0:x1] * (1 - w) + tall * w
+
+        # pass 13 #65: the brass rail under the tube starts ~20 px short of
+        # the left bracket (vanilla too) - a dark gap above the "1". Carry
+        # the rail on to the bracket, copied from just right of its end.
+        r0, r1 = SKILL_GAUGE_RAIL_ROWS
+        d0, d1 = SKILL_GAUGE_RAIL_X
+        src = im[y + r0:y + r1, d1 + 8:d1 + 8 + (d1 - d0)].copy()
+        rw = (np.clip(np.minimum(np.arange(r1 - r0), r1 - r0 - 1 - np.arange(r1 - r0)) / 3.0, 0, 1)[:, None, None]
+              * np.clip(np.minimum(np.arange(d1 - d0) / 3.0, (d1 - d0 - 1 - np.arange(d1 - d0)) / 4.0 + 0.5), 0, 1)[None, :, None])
+        im[y + r0:y + r1, d0:d1] = im[y + r0:y + r1, d0:d1] * (1 - rw) + src * rw
+
+        sy0 = (SKILL_GAUGE_STRIP_Y[0] - 87 + slot) * s
+        sy1 = (SKILL_GAUGE_STRIP_Y[1] - 87 + slot) * s
+        rgb = np.ascontiguousarray(im[..., :3].clip(0, 255).astype(np.uint8))
+        for k in range(5):
+            cx = (SKILL_GAUGE_CELLS_X + 24 * k + 12) * s
+            mask = np.zeros(rgb.shape[:2], np.uint8)
+            mask[sy0 + 3:sy1 - 3, cx - 16:cx + 16] = 255
+            rgb = cv2.inpaint(rgb, mask, 6, cv2.INPAINT_TELEA)
+        im[..., :3] = rgb
+        layer = Image.new("RGBA", (im.shape[1], im.shape[0]), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(layer)
+        cy = (sy0 + sy1) / 2
+        for k in range(5):
+            cx = (SKILL_GAUGE_CELLS_X + 24 * k + 12) * s
+            dr.text((cx + 1.5, cy + 1.5), str(k + 1), font=font, fill=(235, 200, 140, 110), anchor="mm")
+            dr.text((cx, cy), str(k + 1), font=font, fill=SKILL_GAUGE_INK + (255,), anchor="mm")
+        base = Image.fromarray(im.clip(0, 255).astype(np.uint8), "RGBA")
+        base.alpha_composite(layer)
+        im = np.asarray(base).astype(np.float32)
+    Image.fromarray(im.clip(0, 255).astype(np.uint8), "RGBA").save(out_dir / "r0_f0.png")
+    print(f"Skills_Window: {len(SKILL_GAUGE_SLOTS)} gauges - glass filled, 1..5 redrawn")
 
 
 def cmd_hd_schem_tone(only: str | None = None) -> None:
@@ -3253,6 +3609,31 @@ def cmd_hd_schem_tone(only: str | None = None) -> None:
             corr = np.stack([np.asarray(Image.fromarray(delta[..., c], "F").resize((w, h), Image.BILINEAR))
                              for c in range(3)], axis=-1)
             a[..., :3] = rgb + corr
+
+            # Pass 12 feedback (#49, "still tiny bit off the color"): the
+            # smoothed profiles left every drawing's outermost paper ~2/3/7
+            # RGB yellower than the base next to it (most at the right). The
+            # per-side leftover, measured on the paper pixels (the lighter
+            # half - not the grid lines) of the SCHEM_TONE_EDGE outermost px
+            # against the base's same-width band, is taken out by one more
+            # harmonic field.
+            def paper_median(px: np.ndarray) -> np.ndarray:
+                px = px.reshape(-1, 3)
+                lum = px.mean(axis=1)
+                return np.median(px[lum > np.percentile(lum, 50)], axis=0)
+
+            e = SCHEM_TONE_EDGE
+            fixed = a[..., :3]
+            side = {
+                "left": paper_median(base[y0:y0 + h, x0 - e:x0, :3]) - paper_median(fixed[:, :e]),
+                "right": paper_median(base[y0:y0 + h, x0 + w:x0 + w + e, :3]) - paper_median(fixed[:, w - e:]),
+                "top": paper_median(base[y0 - e:y0, x0:x0 + w, :3]) - paper_median(fixed[:e]),
+                "bottom": paper_median(base[y0 + h:y0 + h + e, x0:x0 + w, :3]) - paper_median(fixed[h - e:]),
+            }
+            rest = _harmonic_fill(np.tile(side["left"], (h, 1)), np.tile(side["right"], (h, 1)),
+                                  np.tile(side["top"], (w, 1)), np.tile(side["bottom"], (w, 1)), gh, gw, rows, cols)
+            a[..., :3] += np.stack([np.asarray(Image.fromarray(rest[..., c], "F").resize((w, h), Image.BILINEAR))
+                                    for c in range(3)], axis=-1)
             a[..., 3] = 255
             Image.fromarray(np.clip(a + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / src.name)
         done += 1
@@ -3775,6 +4156,14 @@ FACE_EXTRA_ARTS = [
     "art/interface/SaveLoadListFont.ART",
 ]
 
+# Faces whose '|' is drawn as the face's 'I' (cap height, stem weight), the
+# text-edit cursor (mainmenu_ui.c sub_544100): Outfit's own bar is thinner,
+# taller than the capitals and hangs below the baseline. Pass 12 feedback
+# (#47, "fix the cursor to match this font").
+FACE_CURSOR_BAR = {
+    "art/interface/SaveLoadListFont.ART",
+}
+
 # Extra size factor on a face's matched size (cmd_hd_font_faces), baseline
 # kept. Round 8 pass 11 #18: CharStatsFont's Level/Race/... block read a
 # little large next to the rest of the character sheet.
@@ -3882,7 +4271,8 @@ def cmd_hd_font_faces(only: str | None = None) -> None:
             pad = int(px)
             img = Image.new("L", (int(px * 3) + 2 * pad, int(px * 2.5) + 2 * pad), 0)
             pen_x, base_y = pad, pad + int(px * 1.5)
-            ImageDraw.Draw(img).text((pen_x, base_y), ch, font=font, fill=255, anchor="ls")
+            drawn = "I" if ch == "|" and rel in FACE_CURSOR_BAR else ch
+            ImageDraw.Draw(img).text((pen_x, base_y), drawn, font=font, fill=255, anchor="ls")
             box = img.getbbox()
             if box is None:
                 lines.append(f"g {f['frame']} {adv:.3f} 0 0 -")
@@ -4127,7 +4517,13 @@ def main() -> None:
     p_lensc.add_argument("--only", default=None)
     p_htft = sub.add_parser("hd-htft-knob", help="HP/fatigue -/+ sidecars from the character sheet's own knobs (HTFT_KNOBS)")
     p_htft.add_argument("--only", default=None)
+    p_cyc = sub.add_parser("hd-cycle-arrows", help="Character creation arrow buttons: clean disc + vector arrows (CYCLE_ARROWS)")
+    p_cyc.add_argument("--only", default=None)
     sub.add_parser("hd-schem-base-edge", help="Schematic_Base: opaque ring around the drawing's hole (SCHEM_BASE_HOLE)")
+    sub.add_parser("hd-nav-pill-rim", help="Worldmap bottom plate pills: even rim around the groove (NAV_PILLS)")
+    sub.add_parser("hd-skill-gauge", help="Skills_Window gauges: full glass tube, crisp 1..5 (SKILL_GAUGE_*)")
+    sub.add_parser("hd-saveload-chain", help="Save/Load list's scroll track: the Loot panel's chain painted in (SAVELOAD_CHAIN_*)")
+    sub.add_parser("hd-scroll-chains", help="Loot/Barter panels: chain repainted between the scroll arrows, centred on them (SCROLL_CHAIN_*)")
     p_schem = sub.add_parser("hd-schem-tone", help="Match schematic drawings' edge tone to the base paper (SCHEM_TONE_*)")
     p_schem.add_argument("--only", default=None)
     p_icon = sub.add_parser("hd-icon-patch", help="Re-upscale icons painted into panels with another model (ICON_PATCHES)")
@@ -4250,8 +4646,22 @@ def main() -> None:
     if args.command == "hd-htft-knob":
         cmd_hd_htft_knob(args.only)
         return
+    if args.command == "hd-cycle-arrows":
+        cmd_hd_cycle_arrows(args.only)
+        return
     if args.command == "hd-schem-base-edge":
         cmd_hd_schem_base_edge()
+        return
+    if args.command == "hd-nav-pill-rim":
+        cmd_hd_nav_pill_rim()
+        return
+    if args.command == "hd-skill-gauge":
+        cmd_hd_skill_gauge()
+        return
+    if args.command == "hd-saveload-chain":
+        cmd_hd_saveload_chain()
+    if args.command == "hd-scroll-chains":
+        cmd_hd_scroll_chains()
         return
     if args.command == "hd-schem-tone":
         cmd_hd_schem_tone(args.only)
