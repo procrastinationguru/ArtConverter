@@ -3453,8 +3453,8 @@ def cmd_hd_nav_pill_rim() -> None:
 # Round 8 pass 12 feedback (#59): the charedit Skills_Window's four gauges.
 # - The glass tube (1x x 59..179, the liquid's span) only had its cylinder
 #   in HD rows 17..57 of each slot; below it the "reservoir" read as erased
-#   (near-black). Those rows are stretched over the liquid's rows 12..95
-#   (charedit draws SkilGauge rows 3..23 there), feathered into the rest.
+#   (near-black). It is vanilla's own dark glass: now kept as upscaled with
+#   vanilla's on-screen dark lift applied (#94).
 # - The 1..5 under it were 3-4 px blobs no model can read: each cell
 #   (24 px, dividers at 1x x 59 + 24 k, strip rows 115..122 of slot 0) has
 #   the old digit inpainted away and the digit drawn in SKILL_GAUGE_FONT,
@@ -3468,6 +3468,12 @@ SKILL_GAUGE_FONT = ("texgyrebonum-bold.otf", 26)  # HD px
 SKILL_GAUGE_INK = (58, 34, 18)
 SKILL_GAUGE_RAIL_ROWS = (86, 107)  # HD rows below each slot's top: the rail under the tube
 SKILL_GAUGE_RAIL_X = (214, 293)    # HD x: left bracket .. where the vanilla rail starts
+SKILL_GAUGE_GLASS_ROWS = (12, 88)  # HD rows below each slot's top: the glass (1x 90..108)
+SKILL_GAUGE_LIQUID_EDGE_ALPHA = 0.35  # liquid's alpha at its top/bottom edge (#97)
+SKILL_GAUGE_LIQUID_EDGE_ROWS = 5      # 1x rows from the edge to full alpha
+SKILL_GAUGE_GLASS_LIFT = 30.0    # added at black, fading out by lum 110 (see #94)
+# vanilla on screen: mean glass level of 1x rows 90.. of slot 0 (user capture, #94)
+SKILL_GAUGE_GLASS_PROFILE = (90, [54, 55, 52, 76, 94, 101, 102, 87, 64, 45, 43, 40, 30, 32, 32, 28, 17, 8, 20])
 
 
 def cmd_hd_skill_gauge() -> None:
@@ -3484,14 +3490,31 @@ def cmd_hd_skill_gauge() -> None:
     font = ImageFont.truetype(str(ensure_font(SKILL_GAUGE_FONT[0])), SKILL_GAUGE_FONT[1])
     for slot in SKILL_GAUGE_SLOTS:
         y = slot * s
-        glass = im[y + 17:y + 57, x0:x1]
-        tall = np.asarray(Image.fromarray(glass.astype(np.uint8), "RGBA")
-                          .resize((x1 - x0, 95 - 12), Image.BICUBIC)).astype(np.float32)
-        rows = np.arange(12, 95)
+        # pass 13 #94: the tube is the vanilla glass as upscaled - its
+        # reflection, dark middle and textured lower glass give the cylinder
+        # its volume (stretching rows of it, #59/#92, flattened that). Vanilla
+        # on screen lifts the dark tones (black ~30, 16 -> 45, 90 -> 100),
+        # which is what shows the lower glass; the same lift is applied here,
+        # then each row is scaled to vanilla's on-screen mean
+        # (SKILL_GAUGE_GLASS_PROFILE: highlight, bottom shadow line).
+        g0, g1 = SKILL_GAUGE_GLASS_ROWS
+        glass = im[y + g0:y + g1, x0:x1, :3]
+        lum = glass.mean(axis=2, keepdims=True)
+        lifted = glass + SKILL_GAUGE_GLASS_LIFT * np.clip(1 - lum / 110.0, 0, 1)
+        p0, prof = SKILL_GAUGE_GLASS_PROFILE
+        centers = [(p0 + i - 87 + 0.5) * s for i in range(len(prof))]
+        mid = x0 + (x1 - x0) // 8, x1 - (x1 - x0) // 4  # clear of the end caps
+        cur = lifted[:, mid[0] - x0:mid[1] - x0].mean(axis=(1, 2))
+        want = np.interp(np.arange(g0, g1) + 0.5, centers, prof)
+        gain = want / np.maximum(cur, 1)
+        # smooth the gain over the 1x row so the texture keeps its own detail
+        gain = np.convolve(np.pad(gain, s // 2, mode="edge"), np.ones(s) / s, mode="valid")[:g1 - g0]
+        lifted = lifted * np.clip(gain, 0.2, 2.0)[:, None, None]
+        rows = np.arange(g0, g1)
         cols = np.arange(x0, x1)
-        w = (np.clip(np.minimum(rows - 12, 94 - rows) / 4.0, 0, 1)[:, None, None]
+        w = (np.clip(np.minimum(rows - g0, g1 - 1 - rows) / 3.0, 0, 1)[:, None, None]
              * np.clip(np.minimum(cols - x0, x1 - 1 - cols) / 6.0, 0, 1)[None, :, None])
-        im[y + 12:y + 95, x0:x1] = im[y + 12:y + 95, x0:x1] * (1 - w) + tall * w
+        im[y + g0:y + g1, x0:x1, :3] = glass * (1 - w) + lifted * w
 
         # pass 13 #65: the brass rail under the tube starts ~20 px short of
         # the left bracket (vanilla too) - a dark gap above the "1". Carry
@@ -3524,6 +3547,25 @@ def cmd_hd_skill_gauge() -> None:
         im = np.asarray(base).astype(np.float32)
     Image.fromarray(im.clip(0, 255).astype(np.uint8), "RGBA").save(out_dir / "r0_f0.png")
     print(f"Skills_Window: {len(SKILL_GAUGE_SLOTS)} gauges - glass filled, 1..5 redrawn")
+
+    # pass 13 #97: the liquid (SkilGauge, charedit draws its 1x rows 3..23)
+    # read as a flat opaque block over the glass. Its top and bottom rows
+    # fade (alpha SKILL_GAUGE_LIQUID_EDGE_ALPHA at the edge, full
+    # SKILL_GAUGE_LIQUID_EDGE_ROWS 1x rows in), so the tube's shading shows
+    # through them.
+    liq_dir = hd_out_dir("art/interface/SkilGauge.ART")
+    liq_backup = config.WORK_DIR / "_skill_gauge_originals" / "SkilGauge"
+    if not liq_backup.exists():
+        shutil.copytree(liq_dir, liq_backup)
+    liq = np.asarray(Image.open(liq_backup / "r0_f0.png").convert("RGBA")).astype(np.float32)
+    top, bottom = 3 * s, 24 * s
+    n = SKILL_GAUGE_LIQUID_EDGE_ROWS * s
+    r = np.arange(liq.shape[0], dtype=np.float32) + 0.5
+    t = np.clip(np.minimum(r - top, bottom - r) / n, 0, 1)
+    a0 = SKILL_GAUGE_LIQUID_EDGE_ALPHA
+    liq[..., 3] *= (a0 + (1 - a0) * np.sin(t * np.pi / 2))[:, None]
+    Image.fromarray(liq.clip(0, 255).astype(np.uint8), "RGBA").save(liq_dir / "r0_f0.png")
+    print("SkilGauge: liquid edges faded")
 
 
 def cmd_hd_schem_tone(only: str | None = None) -> None:

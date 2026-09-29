@@ -19,7 +19,7 @@ python pipeline.py hd-schem-base-edge          # Schematic_Base: opaque ring rou
 python pipeline.py hd-htft-knob [--only X]    # HP/fatigue -/+ sidecars (Char_HTFTPlus/Minus) from Char_Maint's knobs + Char_Plus/Minus signs (pass 12 #41); run after re-upscaling those
 python pipeline.py hd-saveload-chain           # Loot panel's chain painted into the SaveLoadBackground / Scheme_Rot scroll tracks (pass 13 #47/#52)
 python pipeline.py hd-nav-pill-rim             # worldmap bottom plate pills (MapMain + Nav_Cvr): even rim round the groove (pass 13 #48)
-python pipeline.py hd-skill-gauge              # Skills_Window: glass tube filled, rail carried to the bracket, 1..5 redrawn crisp (pass 13 #59/#65)
+python pipeline.py hd-skill-gauge              # Skills_Window: vanilla glass kept, shaded row by row to vanilla on screen (volume), rail carried to the bracket, 1..5 redrawn crisp; SkilGauge liquid top/bottom edges faded (pass 13 #59/#65/#94/#97)
 python pipeline.py hd-cycle-arrows [--only X] # char creation arrow buttons: clean disc, vector arrows, socket-centred (pass 13 #62)
 python pipeline.py hd-scroll-chains            # Loot/Barter/Barter_Follower: vanilla chain painted out, repainted between the scroll arrows, centred on them (pass 13 #89)
 python pipeline.py hd-disc-mask [--only X]    # cut round buttons (DISC_MASKS) to their disc
