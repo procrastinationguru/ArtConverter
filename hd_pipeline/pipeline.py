@@ -3568,6 +3568,277 @@ def cmd_hd_skill_gauge() -> None:
     print("SkilGauge: liquid edges faded")
 
 
+# Side bars (widescreen pillarbox decoration, drawn by the engine only in
+# game - arcanum-ce tig_video_side_bars_*). Design settled in mocks 9-17
+# (user rounds, final = "mock17M"): the top HUD's metal carried down as two
+# layered plates (inner one inset; a quarter-circle cut at the game edge), the
+# plates' edges in IntTop's own edge colours (left bar: dark outline + shadow,
+# right bar: bright bevel - one light from the left), rivets; below them
+# MPChatBackground's carved knot stood upright, its gold line on the game edge,
+# ending 15 screen px above the bottom. Built in right-bar orientation (x=0 at
+# the game edge); the left bar is its mirror but built on its own (the edge
+# light isn't mirrored), both saved in screen orientation. Plus the cap: the
+# top HUD's metal mirrored over its brown end strip (IntTop's last 3 px), baked
+# into IntTop's sidecar (original kept in work/_sidebar_originals/; a 4:3
+# window shows that metal end too).
+SIDE_BARS_DIR = "art/interface/_SideBars"
+SIDE_BAR_WIDTHS = [213, 356, 533, 830, 1778]  # HD px at 1600 tall: 16:10, 16:9, 2:1, 21:9, 32:9
+SIDE_BAR_H = 1600
+SIDE_BAR_SPLIT = 0.449          # base plate's flat lower edge (share of H)
+SIDE_BAR_ARC = 0.156            # its quarter-circle cut, centred on the game edge at the split
+SIDE_BAR_INSET = 21             # inner plate inset from the base plate's edges
+SIDE_BAR_EDGE = 10.0            # IntTop's plate edge band, HD px
+SIDE_BAR_EDGE_DARK = (14, 13, 8)                             # the top HUD's dark bottom line
+SIDE_BAR_EDGE_LIT = tuple(v * 1.09 for v in (99, 97, 101))   # IntTop's bevel as it shows on screen
+SIDE_BAR_METAL_TONE = (8.2 / 9.7, (49.9 - 43.8) / 255)       # fine contrast, brightness -> IntTop's metal
+SIDE_BAR_KNOT_Y = 440           # knot panel top (under the metal)
+SIDE_BAR_KNOT_BOT = 15 / 1125   # the knot ends this share of H above the bottom
+SIDE_BAR_KNOT_MARG = 40         # carving's gap to the gold line and to the outer edge (bar px at 356)
+SIDE_BAR_KNOT_KX = 1.49         # the carving's sideways scale at 356 (wider bars: more knots, near this)
+SIDE_BAR_KNOT_CONTRAST = 0.62   # share of the carving's own contrast kept (colour/brightness -> the wood)
+SIDE_BAR_KNOT_SHARP = 0.15      # sharpen across the knot (its sideways stretch softens it)
+SIDE_BAR_KNOT_HIGH = 0.33       # copper highlights toned down by this
+SIDE_BAR_RIVETS = [(55, 30), (55, 215)]            # down the inner plate's game side; + 3 round its arc
+SIDE_BAR_CAP = (3176, 3188, 3200)                  # IntTop cols: source, and the brown strip they cover
+
+
+def _sb_load(name: str) -> np.ndarray:
+    return np.asarray(Image.open(hd_out_dir(f"art/interface/{name}.ART") / "r0_f0.png")
+                      .convert("RGBA")).astype(np.float32) / 255
+
+
+def _sb_resize(a: np.ndarray, w: int, h: int) -> np.ndarray:
+    im = Image.fromarray((np.clip(a, 0, 1) * 255).astype(np.uint8))
+    return np.asarray(im.resize((w, h), Image.LANCZOS)).astype(np.float32) / 255
+
+
+def _sb_hsv(a: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    mx = a[..., :3].max(-1)
+    mn = a[..., :3].min(-1)
+    return mx, np.where(mx > 0, (mx - mn) / np.maximum(mx, 1e-6), 0)
+
+
+def _sb_match(img: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    px = img[..., :3].reshape(-1, 3)
+    out = img.copy()
+    out[..., :3] = (img[..., :3] - px.mean(0)) / (px.std(0) + 1e-6) * ref.std(0) + ref.mean(0)
+    return np.clip(out, 0, 1)
+
+
+def _sb_wood_tone(bot: np.ndarray) -> np.ndarray:
+    """Mean colour of IntBotom's plain wood (per-row medians of its end parts, as the mocks' grain)."""
+    from scipy import ndimage
+
+    lum, sat = _sb_hsv(bot)
+    r, g, b = bot[..., 0], bot[..., 1], bot[..., 2]
+    ok = (bot[..., 3] > 0.99) & (sat > 0.25) & (sat < 0.72) & (lum > 0.08) & (lum < 0.45) & (r >= g) & (g >= b * 0.95)
+    sel = np.zeros_like(ok)
+    sel[:, 2440:3200] = True
+    sel[:, 0:760] = True
+    ok &= sel
+    prof = np.array([np.median(bot[y, ok[y], :3], 0) if ok[y].sum() > 10 else [np.nan] * 3
+                     for y in range(bot.shape[0])])
+    for c in range(3):
+        v = prof[:, c]
+        bad = np.isnan(v)
+        v[bad] = np.interp(np.nonzero(bad)[0], np.nonzero(~bad)[0], v[~bad])
+    trend = ndimage.gaussian_filter1d(prof, 12, axis=0)
+    dev = prof - trend
+    lim = 1.2 * dev[24:].std(0)
+    return (trend[24:] + np.clip(dev[24:], -lim, lim)).mean(0)
+
+
+def _sb_metal(plaque: np.ndarray, ref: np.ndarray, w: int, roll: int, flip: bool) -> np.ndarray:
+    from scipy import ndimage
+
+    h = SIDE_BAR_H
+    s = h / 2400.0
+    pw, ph = int(plaque.shape[1] * s * 1.1), int(plaque.shape[0] * s * 1.1)
+    tile = _sb_resize(plaque, pw, ph)[..., :3]
+    if flip:
+        tile = tile[:, ::-1]
+    while tile.shape[1] < w:  # wide bars: mirrored copies either side of the centre one
+        tile = np.concatenate([tile[:, ::-1], tile, tile[:, ::-1]], 1)
+    tile = np.concatenate([tile, tile[::-1]], 0)
+    while tile.shape[0] < h + roll:
+        tile = np.concatenate([tile, tile], 0)
+    x0 = (tile.shape[1] - w) // 2
+    metal = tile[roll:roll + h, x0:x0 + w]
+    low = ndimage.gaussian_filter(metal, (14, 14, 0))
+    metal = _sb_match(low * 0.5 + low.mean((0, 1)) * 0.5 + (metal - low), ref)
+    lo = ndimage.gaussian_filter(metal, (8, 8, 0))
+    return lo + (metal - lo) * SIDE_BAR_METAL_TONE[0] + SIDE_BAR_METAL_TONE[1]
+
+
+def _sb_knot(mp: np.ndarray, w: int) -> tuple[np.ndarray, int, int]:
+    """The knot panel for a bar `w` wide, game edge at x=0: gold line, then carving column(s) with
+    SIDE_BAR_KNOT_MARG gaps. MPChatBackground's band (rows: gold line 59..68, dark gap 68..97, carving
+    97..274; cols: knot 2250 down to its end at 1333, plain wood to 1292) stood upright; each part at its
+    own sideways scale. Returns (panel, gold width, first column of the carving's processing)."""
+    h = SIDE_BAR_H
+    kend, kb0, k1 = 1333, 1292, 2250
+    sc = (h - round(SIDE_BAR_KNOT_BOT * h) - SIDE_BAR_KNOT_Y) / (k1 - kend)
+    ph = int((k1 - kb0) * sc)
+
+    def seg(r0, r1, sw):
+        return _sb_resize(np.rot90(mp[r0:r1, kb0:k1], 1), sw, ph)
+
+    gw = int(round(9 * 1.364))
+    marg = SIDE_BAR_KNOT_MARG if w >= 356 else int(round(SIDE_BAR_KNOT_MARG * w / 356))
+    # number of carving columns: the one whose sideways scale is closest to the 356 bar's
+    n = min(range(1, 8), key=lambda k: abs((w - gw - marg * (k + 1)) / k / (274 - 97) - SIDE_BAR_KNOT_KX))
+    cw = (w - gw - marg * (n + 1)) // n
+    kx = cw / (274 - 97)
+    parts = [seg(59, 68, gw), seg(68, 97, marg)]
+    for i in range(n):
+        parts.append(seg(97, 274, cw))
+        mw = w - gw - marg - n * cw - marg * (n - 1) if i == n - 1 else marg
+        parts.append(seg(274, 274 + int(np.ceil(mw / kx)), mw))
+    panel = np.concatenate(parts, 1)
+    # below the knot: the band's plain wood (between its frame line and the knot) to the bottom
+    ke = int((k1 - kend) * sc)
+    rest = h - SIDE_BAR_KNOT_Y - ke - 4
+    panel = np.concatenate([panel[:ke + 4], _sb_resize(panel[ke + 4:], w, max(rest, 1))], 0)
+    panel[:, :gw] = _sb_resize(panel[:ke, :gw], gw, panel.shape[0])  # gold line: one even run
+    return panel[:h - SIDE_BAR_KNOT_Y, :, :3], gw, gw + marg // 2
+
+
+def _sb_build(side: str, w: int, src: dict) -> np.ndarray:
+    from scipy import ndimage
+
+    h = SIDE_BAR_H
+    s = h / 2400.0
+    split = int(h * SIDE_BAR_SPLIT)
+    arc = int(SIDE_BAR_ARC * h)
+    pad = 64
+    ys, xs = np.mgrid[:h, :w]
+    edge_dark = np.array(SIDE_BAR_EDGE_DARK) / 255.0
+    edge_lit = np.array(SIDE_BAR_EDGE_LIT) / 255.0
+
+    def sdist(m):
+        # the game edge (x<0) is an edge; above the screen top and past the outer edge the rows go on
+        p = np.pad(m, ((pad, 0), (0, 0)), mode="edge")
+        p = np.pad(p, ((0, 0), (0, pad)), mode="edge")
+        p = np.pad(p, ((0, 0), (1, 0)), constant_values=False)
+        return (ndimage.distance_transform_edt(p)[pad:, 1:w + 1],
+                ndimage.distance_transform_edt(~p)[pad:, 1:w + 1])
+
+    def plate(img, m, metal, lit_gain=1.0):
+        din, dout = sdist(m)
+        mf = np.clip(din - dout + 0.5, 0, 1)[..., None]
+        img = img * (1 - mf) + metal * mf
+        gyy, gxx = np.gradient(ndimage.gaussian_filter(din - dout, 2.0))
+        nx = -gxx / (np.hypot(gxx, gyy) + 1e-6)  # outward normal, x (build orientation)
+        if side == "L":
+            nx = -nx  # screen orientation: the light is from the left on both bars
+        lit = np.clip(-nx, 0, 1) ** 1.3
+        d_in, d_out = din / s, dout / s
+        band = np.clip((SIDE_BAR_EDGE + 0.5 - d_in) / 1.5, 0, 1)[..., None] * mf
+        col = edge_dark * (1 - lit[..., None]) + edge_lit * lit_gain * lit[..., None]
+        col = col + (metal - metal.mean((0, 1))) * 0.35 * lit[..., None]
+        img = img * (1 - band) + col * band
+        shadow = (1 - lit) * 0.4 * np.clip((24 - d_out) / 12, 0, 1) + lit * 0.12 * np.clip((6 - d_out) / 6, 0, 1)
+        return img * (1 - shadow * (1 - mf[..., 0]))[..., None]
+
+    img = np.zeros((h, w, 3), np.float32)
+
+    # knot panel: colour/brightness to the HUD's wood, the carving keeps part of its own contrast
+    pv, gw, c0 = _sb_knot(src["mp"], w)
+    pl, ps = _sb_hsv(pv)
+    gold = (ps > 0.45) & (pl > 0.35)
+    toned = np.clip((pv - pv[~gold].mean(0)) * SIDE_BAR_KNOT_CONTRAST + src["wood"], 0, 1)
+    pv = np.where(gold[..., None], np.clip(pv * 1.25, 0, 1), toned)
+    pv[:, :gw + 1] = ndimage.gaussian_filter1d(pv[:, :gw + 1], 10, axis=0)  # even gold line
+    k = pv[:, c0:]
+    k = np.clip(k + SIDE_BAR_KNOT_SHARP * (k - ndimage.gaussian_filter1d(k, 1.6, axis=1)), 0, 1)
+    lum = k.mean(-1)
+    ex = np.maximum(lum - ndimage.gaussian_filter(lum, 8) - 0.03, 0)  # highlights: above the local tone
+    ratio = ((lum - ex * SIDE_BAR_KNOT_HIGH) / np.maximum(lum, 0.01))[..., None]
+    less_pink = np.clip(ex / 0.15, 0, 1)[..., None] * 0.3
+    pv[:, c0:] = np.clip(k * ratio * (1 - less_pink) + k.mean(-1, keepdims=True) * ratio * less_pink, 0, 1)
+    img[SIDE_BAR_KNOT_Y:] = pv
+
+    # base plate (quarter-circle cut at the game edge) and the raised inner plate on it
+    base_m = (ys < split) & (np.hypot(xs, ys - split) > arc)
+    inner_m = sdist(base_m)[0] >= SIDE_BAR_INSET
+    img = plate(img, base_m, _sb_metal(src["plaque"], src["ref"], w, 0, False), lit_gain=1.012)
+    img = plate(img, inner_m, _sb_metal(src["plaque"], src["ref"], w, 700, True))
+
+    rv = src["rivet"]
+    rsz = rv.shape[0]
+    rsh = ndimage.gaussian_filter(rv[..., 3], 1.2)
+    rivets = list(SIDE_BAR_RIVETS) + [(305 * np.sin(np.radians(a)), split - 305 * np.cos(np.radians(a)))
+                                      for a in (10, 45, 79)]
+    for x, y in rivets:
+        x, y = int(x - rsz / 2), int(y - rsz / 2)
+        if x + 1 + rsz > w:
+            continue  # narrow bars (16:10): the arc's outer rivet is past the edge
+        img[y + 2:y + 2 + rsz, x + 1:x + 1 + rsz] *= (1 - 0.5 * rsh)[..., None]
+        sub = img[y:y + rsz, x:x + rsz]
+        sub[:] = sub * (1 - rv[..., 3:4]) + rv[..., :3] * rv[..., 3:4]
+
+    xn = np.arange(w) / (w - 1)  # metal a little darker toward the outer edge
+    vm = ndimage.gaussian_filter(base_m.astype(np.float32), 3)
+    img *= (1 - 0.18 * xn[None, :] ** 2 * vm)[..., None]
+    img = np.clip(img, 0, 1)
+    return img if side == "R" else img[:, ::-1]
+
+
+def cmd_hd_side_bars() -> None:
+    from scipy import ndimage
+
+    top = _sb_load("IntTop")
+    lum, sat = _sb_hsv(top)
+    metal_px = (top[..., 3] > 0.99) & (sat < 0.28) & (lum > 0.08) & (lum < 0.45)
+    s = SIDE_BAR_H / 2400.0
+
+    # rivet: IntTop's copper dome, a bit bigger than the HUD's
+    rv = top[0:34, 944:980].copy()
+    rl, rs_ = _sb_hsv(rv)
+    rm = ndimage.binary_fill_holes(ndimage.binary_closing((rs_ > 0.35) & (rl > 0.25), iterations=2))
+    lab, n = ndimage.label(rm)
+    rm = lab == (1 + np.argmax(ndimage.sum(rm, lab, range(1, n + 1))))
+    yy, xx = np.nonzero(rm)
+    rcy, rcx, rr = yy.mean(), xx.mean(), max(np.ptp(yy), np.ptp(xx)) / 2 + 1
+    gy, gx = np.mgrid[:rv.shape[0], :rv.shape[1]]
+    rv[..., 3] = np.clip(rr + 0.5 - np.hypot(gy - rcy, gx - rcx), 0, 1)
+    rsz = max(8, int(2 * rr * s * 1.1 * 1.35))
+    rivet = _sb_resize(rv[int(rcy - rr - 1):int(rcy + rr + 2), int(rcx - rr - 1):int(rcx + rr + 2)], rsz, rsz)
+
+    src = {
+        "mp": _sb_load("MPChatBackground"),
+        "plaque": _sb_load("MenuPlaque")[12:940, 12:920],
+        "ref": top[:, 2900:3188][metal_px[:, 2900:3188]][:, :3],  # the top bar's end plate
+        "wood": _sb_wood_tone(_sb_load("IntBotom")),
+        "rivet": rivet,
+    }
+
+    out = config.HD_OVERLAY_DIR / SIDE_BARS_DIR
+    if out.exists():
+        shutil.rmtree(out)  # the old layout (base/over/magic) goes
+    out.mkdir(parents=True)
+    lines = ["# hd-side-bars (art-converter pipeline.py). Screen orientation: left_<w> left of the game, right_<w> right.",
+             "# bar <width> <height>"]
+    for bw in SIDE_BAR_WIDTHS:
+        for side, name in (("L", "left"), ("R", "right")):
+            a = _sb_build(side, bw, src)
+            Image.fromarray((a * 255 + 0.5).astype(np.uint8), "RGB").save(out / f"{name}_{bw}.png")
+        lines.append(f"bar {bw} {SIDE_BAR_H}")
+        print(f"side bars {bw}: done")
+
+    # the cap: baked into the HUD's sidecar, so it shows exactly when the HUD does
+    top_dir = hd_out_dir("art/interface/IntTop.ART")
+    backup = config.WORK_DIR / "_sidebar_originals" / "IntTop"
+    if not backup.exists():
+        shutil.copytree(top_dir, backup)
+    a = np.asarray(Image.open(backup / "r0_f0.png").convert("RGBA")).copy()
+    c0, c1, c2 = SIDE_BAR_CAP
+    a[:, c1:c2] = a[:, c1 - (c2 - c1):c1][:, ::-1]
+    Image.fromarray(a, "RGBA").save(top_dir / "r0_f0.png")
+    (out / "layout.txt").write_text("\n".join(lines) + "\n")
+    print(f"side bars -> {out}")
+
+
 def cmd_hd_schem_tone(only: str | None = None) -> None:
     from scipy import ndimage
 
@@ -3890,6 +4161,60 @@ def cmd_hd_frame_smooth(only: str | None = None, size: int = 5) -> None:
             Image.fromarray(np.clip(a + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / src.name)
             print(f"{name}/{src.name}: frame smoothed ({gold.mean():.1%} gold)")
 
+
+
+# Stair-stepped arcs (the upscale kept the vanilla pixel steps): blurred along
+# the circle only, so the radial profile (bevel lines) stays sharp. name ->
+# [(centre x, y, inner r, outer r, side) in HD px]; side -1 = the quadrant from
+# straight down to the left, +1 = down to the right. The centre is refined in
+# +-6 px to the one that lines the edges up best. Backup once to
+# work/_arc_originals/ (after hd-black-fill: re-running that drops the arcs).
+ARC_SMOOTH = {"IntBotom": [(717, 89, 78, 118, -1), (2490, 84, 78, 120, 1)]}   # hotbar ends
+
+
+def cmd_hd_arc_smooth(only: str | None = None, sigma: float = 7.0) -> None:
+    from scipy import ndimage
+
+    def samples(a, cx, cy, rad, ang, side):
+        X, Y = cx + side * rad * np.cos(ang), cy + rad * np.sin(ang)
+        return np.stack([ndimage.map_coordinates(a[..., c], [Y, X], order=1) for c in range(3)], -1)
+
+    def alignment(a, cx, cy, r0, r1, side):
+        R, T = np.meshgrid(np.arange(r0, r1, 0.5), np.linspace(0.2, np.pi / 2 - 0.2, 300), indexing="ij")
+        prof = samples(a, cx, cy, R, T, side).mean(-1).mean(1)
+        return np.abs(np.diff(prof)).sum()
+
+    for name, arcs in ARC_SMOOTH.items():
+        if only is not None and only.lower() not in name.lower():
+            continue
+        out_dir = hd_out_dir(f"art/interface/{name}.ART")
+        backup = config.WORK_DIR / "_arc_originals" / name
+        if not backup.exists():
+            shutil.copytree(out_dir, backup)
+        for src in sorted(backup.glob("*.png")):
+            a = np.asarray(Image.open(src).convert("RGBA")).astype(np.float32)
+            out = a.copy()
+            ys, xs = np.mgrid[:a.shape[0], :a.shape[1]].astype(np.float32)
+            for cx, cy, r0, r1, side in arcs:
+                _, cx, cy = max((alignment(a, cx + i, cy + j, r0, r1, side), cx + i, cy + j)
+                                for i in range(-6, 7) for j in range(-6, 7))
+                r = np.hypot(xs - cx, ys - cy)
+                th = np.arctan2(ys - cy, (xs - cx) * side)
+                m = (r > r0) & (r < r1) & (th > -0.05) & (th < np.pi / 2 + 0.05)
+                yy, xx = np.nonzero(m)
+                rad, ang = r[yy, xx], th[yy, xx]
+                acc, ws = 0.0, 0.0
+                for s in np.arange(-3 * sigma, 3 * sigma + 0.1, 1.0):
+                    w = np.exp(-0.5 * (s / sigma) ** 2)
+                    acc = acc + w * samples(a, cx, cy, rad, ang + s / rad, side)
+                    ws += w
+                blur = np.zeros_like(a[..., :3])
+                blur[yy, xx] = acc / ws
+                f = (np.clip(np.minimum(r - r0, r1 - r) / 4, 0, 1)
+                     * np.clip(np.minimum(th + 0.05, np.pi / 2 + 0.05 - th) / 0.12, 0, 1) * m)[..., None]
+                out[..., :3] = out[..., :3] * (1 - f) + blur * f
+                print(f"{name}/{src.name}: arc at ({cx}, {cy}) smoothed")
+            Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / src.name)
 
 # Lens rings over a panel whose HD sidecar is a hole / black under the lens
 # (#221-#223): the ring's own corner wood (outside the gold, r > ~49.5 1x
@@ -4551,6 +4876,8 @@ def main() -> None:
     p_outer.add_argument("--only", default=None)
     p_frame = sub.add_parser("hd-frame-smooth", help="Round off wobbly gold panel frames (FRAME_SMOOTH)")
     p_frame.add_argument("--only", default=None)
+    p_arc = sub.add_parser("hd-arc-smooth", help="Smooth stair-stepped arcs along the circle (ARC_SMOOTH)")
+    p_arc.add_argument("--only", default=None)
     p_cvr = sub.add_parser("hd-cvr-mask", help="Paperdoll slot silhouettes: keep only the silhouette (CVR_SLOTS)")
     p_cvr.add_argument("--only", default=None)
     p_disc = sub.add_parser("hd-disc-mask", help="Cut round buttons' sidecars to their disc (DISC_MASKS)")
@@ -4564,6 +4891,7 @@ def main() -> None:
     sub.add_parser("hd-schem-base-edge", help="Schematic_Base: opaque ring around the drawing's hole (SCHEM_BASE_HOLE)")
     sub.add_parser("hd-nav-pill-rim", help="Worldmap bottom plate pills: even rim around the groove (NAV_PILLS)")
     sub.add_parser("hd-skill-gauge", help="Skills_Window gauges: full glass tube, crisp 1..5 (SKILL_GAUGE_*)")
+    sub.add_parser("hd-side-bars", help="Widescreen side bars: metal plates + carved knot, left/right art per width (SIDE_BAR_*)")
     sub.add_parser("hd-saveload-chain", help="Save/Load list's scroll track: the Loot panel's chain painted in (SAVELOAD_CHAIN_*)")
     sub.add_parser("hd-scroll-chains", help="Loot/Barter panels: chain repainted between the scroll arrows, centred on them (SCROLL_CHAIN_*)")
     p_schem = sub.add_parser("hd-schem-tone", help="Match schematic drawings' edge tone to the base paper (SCHEM_TONE_*)")
@@ -4676,6 +5004,9 @@ def main() -> None:
     if args.command == "hd-frame-smooth":
         cmd_hd_frame_smooth(args.only)
         return
+    if args.command == "hd-arc-smooth":
+        cmd_hd_arc_smooth(args.only)
+        return
     if args.command == "hd-cvr-mask":
         cmd_hd_cvr_mask(args.only)
         return
@@ -4699,6 +5030,8 @@ def main() -> None:
         return
     if args.command == "hd-skill-gauge":
         cmd_hd_skill_gauge()
+    if args.command == "hd-side-bars":
+        cmd_hd_side_bars()
         return
     if args.command == "hd-saveload-chain":
         cmd_hd_saveload_chain()
