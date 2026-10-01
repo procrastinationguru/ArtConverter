@@ -2024,7 +2024,16 @@ def read_ini_palettes(ini_path: Path) -> list[np.ndarray]:
     return out
 
 
-def cmd_hd_palettes(categories: list[str], model: str | None = None, force: bool = False) -> None:
+# Palette variants upscale in PALETTE_WORKERS parallel chunks, each its own
+# ncnn directory batch + post-processing thread. The GPU (RTX 4070 Ti SUPER,
+# 16 GB) runs up to 8 at once easily; one chunk left it mostly idle (580k
+# critter palette frames were ~12 h on one worker).
+PALETTE_WORKERS = 8
+
+
+def cmd_hd_palettes(categories: list[str], model: str | None = None, force: bool = False,
+                    workers: int = PALETTE_WORKERS) -> None:
+    from concurrent.futures import ThreadPoolExecutor
     esrgan_model = model or config.REALESRGAN_MODEL
     root = config.WORK_DIR / "_palettes"
     for category in categories:
@@ -2060,20 +2069,33 @@ def cmd_hd_palettes(categories: list[str], model: str | None = None, force: bool
                         continue
                     src = np.clip(inpaint_colorkey(palettes[p][idx], key), 0, 255).astype(np.uint8)
                     name = f"{len(staged):06d}.png"
-                    Image.fromarray(dedither(src, key), "RGB").save(root / "in" / name)
-                    staged.append(dict(rel=rel, dest=dest, w=w, h=h, key=key, name=name))
-        print(f"hd-palettes {category}: {len(staged)} palette frame(s) to upscale", flush=True)
+                    chunk = len(staged) % workers
+                    (root / "in" / str(chunk)).mkdir(exist_ok=True)
+                    Image.fromarray(dedither(src, key), "RGB").save(root / "in" / str(chunk) / name)
+                    staged.append(dict(rel=rel, dest=dest, w=w, h=h, key=key, name=name, chunk=chunk))
+        print(f"hd-palettes {category}: {len(staged)} palette frame(s) to upscale ({workers} workers)", flush=True)
         if not staged:
             continue
-        run_esrgan_batch(root / "in", root / "out", esrgan_model)
-        for s in staged:
-            out = root / "out" / s["name"]
-            out = soup_fallback(root / "in" / s["name"], out, esrgan_model, root / "soup")
-            hd = load_and_validate(out, (s["w"] * HD_SCALE, s["h"] * HD_SCALE), "hd-palettes")
-            mask_rgb = Image.fromarray(np.where(s["key"], 0, 255).astype(np.uint8), "L").convert("RGB")
-            hd.putalpha(hqx.hq4x(mask_rgb).convert("L"))
-            write_sidecar(s["rel"], s["dest"], hd)
-        print(f"hd-palettes {category}: wrote {len(staged)} sidecar(s)", flush=True)
+
+        def run_chunk(i: int) -> int:
+            cin, cout = root / "in" / str(i), root / "out" / str(i)
+            run_esrgan_batch(cin, cout, esrgan_model)
+            n = 0
+            for s in staged:
+                if s["chunk"] != i:
+                    continue
+                out = soup_fallback(cin / s["name"], cout / s["name"], esrgan_model, root / "soup" / str(i))
+                hd = load_and_validate(out, (s["w"] * HD_SCALE, s["h"] * HD_SCALE), "hd-palettes")
+                mask_rgb = Image.fromarray(np.where(s["key"], 0, 255).astype(np.uint8), "L").convert("RGB")
+                hd.putalpha(hqx.hq4x(mask_rgb).convert("L"))
+                write_sidecar(s["rel"], s["dest"], hd)
+                n += 1
+            print(f"hd-palettes {category}: chunk {i} done ({n})", flush=True)
+            return n
+
+        with ThreadPoolExecutor(workers) as ex:
+            done = sum(ex.map(run_chunk, sorted({s["chunk"] for s in staged})))
+        print(f"hd-palettes {category}: wrote {done} sidecar(s)", flush=True)
     shutil.rmtree(root, ignore_errors=True)
 
 
