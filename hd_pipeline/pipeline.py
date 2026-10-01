@@ -120,6 +120,8 @@ def frame_bmps(wd: Path) -> list[Path]:
 #   32.4-71.5 - garbage (XP_Pip1-10, ScrllSlideB/T - real static)
 # Wide gap, no overlap - 20.0 sits comfortably in it.
 PIXEL_SOUP_ROUGHNESS_THRESHOLD = 20.0
+PIXEL_SOUP_MODEL = "remacri-4x"   # redoes a too-rough frame (was Real-CUGAN: washed textured icons out)
+PIXEL_SOUP_GARBAGE = 32.0         # still this rough after that: real static -> Real-CUGAN, last resort
 
 
 def roughness(img: Image.Image) -> float:
@@ -127,6 +129,28 @@ def roughness(img: Image.Image) -> float:
     dx = np.abs(np.diff(arr, axis=1)).mean()
     dy = np.abs(np.diff(arr, axis=0)).mean()
     return (dx + dy) / 2
+
+
+def soup_fallback(src_png: Path, out_png: Path, model: str, work: Path) -> Path:
+    """A too-rough ESRGAN output (PIXEL_SOUP_ROUGHNESS_THRESHOLD) is redone with
+    PIXEL_SOUP_MODEL (padded); still in the garbage band -> Real-CUGAN as the
+    last resort. Returns the png to use (out_png itself when it was fine)."""
+    out = out_png
+    if roughness(Image.open(out)) > PIXEL_SOUP_ROUGHNESS_THRESHOLD and model != PIXEL_SOUP_MODEL:
+        one_in, one_out = work / "_soup_in", work / "_soup_out"
+        for d in (one_in, one_out):
+            shutil.rmtree(d, ignore_errors=True)
+        one_in.mkdir(parents=True)
+        shutil.copyfile(src_png, one_in / src_png.name)
+        run_padded_batch(one_in, one_out, lambda i, o: [
+            str(config.REALESRGAN_EXE), "-i", str(i), "-o", str(o), "-s", str(HD_SCALE), "-n", PIXEL_SOUP_MODEL,
+        ])
+        out = one_out / src_png.name
+    if roughness(Image.open(out)) > PIXEL_SOUP_GARBAGE:
+        out = work / "_soup_cugan" / src_png.name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        run_realcugan(src_png, out)
+    return out
 
 
 def run_esrgan(src_png: Path, dest_png: Path, model: str) -> None:
@@ -869,7 +893,7 @@ HD_SCALE = 4
 # rule was the ncnn directory-mode corruption (see verify_batch), and
 # single-file ESRGAN matched or beat CUGAN on 60 small interface frames
 # (comparison/small_frames/) - CUGAN kept dither as a mesh. One model for
-# everything; CUGAN is left for FORCE_CUGAN_ASSETS and the soup fallback.
+# everything; CUGAN is left for FORCE_CUGAN_ASSETS and as the soup fallback's last resort (soup_fallback: remacri first).
 # Still used by the tile self-wrap route (whose composites are never small)
 # and to find the frames that took the old route (hd-requeue).
 HD_SMALL_FRAME_PX = 48
@@ -1165,21 +1189,19 @@ def cmd_hd(rel_path: str, model: str | None = None, force: bool = False, quiet: 
                 hd = load_and_validate(retry_png, expected_size, "realesrgan retry")
                 if is_blank_output(hd):
                     raise RuntimeError(f"realesrgan produced blank output twice for {bmp}")
-            pixel_soup_fallback = roughness(hd) > PIXEL_SOUP_ROUGHNESS_THRESHOLD
-            if pixel_soup_fallback:
-                # Real-CUGAN beats the Lanczos+ESRGANx4 hybrid here too - confirmed
-                # on a 50-sample sweep (ELM-FIRE-Wal/Generic-Smoke/etc: hybrid still
-                # desaturates/blobs the glow, CUGAN keeps it clean). Also doubles as
-                # a safety net for tile-race glitches under batch GPU contention
-                # (I_BeautyMedalion: clean under light load, pixel soup only under
-                # heavy concurrent load) - roughness re-check below still applies.
-                cugan_png = bmp.with_name(bmp.stem + "_hd_cugan.png")
-                run_realcugan(esrgan_in / key_name, cugan_png)
-                hd = load_and_validate(cugan_png, expected_size, "realcugan fallback")
+            # Too rough: redone with remacri (soup_fallback). It used to go to Real-CUGAN, which
+            # washed out textured icons whose upscale is merely busy (I_MigraineCure 21.4,
+            # 2026-10-01); garbage from GPU flakes is caught by verify_batch's correlation check.
+            batch_png = esrgan_out / key_name
+            hd.save(batch_png)
+            used = soup_fallback(esrgan_in / key_name, batch_png, esrgan_model, wd / "_soup")
+            pixel_soup_fallback = used.parent.name == "_soup_cugan"
+            if used != batch_png:
+                hd = load_and_validate(used, expected_size, "soup fallback")
                 if is_blank_output(hd):
-                    raise RuntimeError(f"realcugan fallback produced blank output for {bmp}")
+                    raise RuntimeError(f"soup fallback produced blank output for {bmp}")
                 if not quiet:
-                    print(f"  Pixel soup from direct ESRGAN on {bmp.name}, used Real-CUGAN fallback instead")
+                    print(f"  {bmp.name}: rough {esrgan_model} output, used {'Real-CUGAN' if pixel_soup_fallback else PIXEL_SOUP_MODEL}")
 
         # Alpha: hq4x edge-directed upscale of the binary key mask (not a
         # blur/SDF - pattern-matches the local 3x3 neighborhood like the
@@ -1920,10 +1942,7 @@ def regenerate_frames(jobs: list[tuple[str, list[tuple[int, int]] | None]], mode
                 out = root / "c_out" / name
             else:
                 out = root / "e_out" / name
-                if roughness(Image.open(out)) > PIXEL_SOUP_ROUGHNESS_THRESHOLD:
-                    out = root / "soup" / name
-                    out.parent.mkdir(exist_ok=True)
-                    run_realcugan(e_in / name, out)
+                out = soup_fallback(e_in / name, out, esrgan_model, root / "soup")
             hd = load_and_validate(out, (s["w"] * HD_SCALE, s["h"] * HD_SCALE), "regenerate")
             mask_rgb = Image.fromarray(np.where(s["key"], 0, 255).astype(np.uint8), "L").convert("RGB")
             hd.putalpha(hqx.hq4x(mask_rgb).convert("L"))
@@ -2049,10 +2068,7 @@ def cmd_hd_palettes(categories: list[str], model: str | None = None, force: bool
         run_esrgan_batch(root / "in", root / "out", esrgan_model)
         for s in staged:
             out = root / "out" / s["name"]
-            if roughness(Image.open(out)) > PIXEL_SOUP_ROUGHNESS_THRESHOLD:
-                out = root / "soup" / s["name"]
-                out.parent.mkdir(exist_ok=True)
-                run_realcugan(root / "in" / s["name"], out)
+            out = soup_fallback(root / "in" / s["name"], out, esrgan_model, root / "soup")
             hd = load_and_validate(out, (s["w"] * HD_SCALE, s["h"] * HD_SCALE), "hd-palettes")
             mask_rgb = Image.fromarray(np.where(s["key"], 0, 255).astype(np.uint8), "L").convert("RGB")
             hd.putalpha(hqx.hq4x(mask_rgb).convert("L"))
@@ -2072,6 +2088,7 @@ def cmd_hd_palettes(categories: list[str], model: str | None = None, force: bool
 # applied to the whole stack before slicing so no joint gets a softened edge.
 SCROLL_THUMB_PIECES = ("art/interface/ScrllSlideT.ART", "art/interface/ScrllSlideM1.ART", "art/interface/ScrllSlideB.ART")
 SCROLL_THUMB_REPEAT = 24
+SCROLL_THUMB_MODEL = "remacri-4x"   # as the scroll arrows (REMACRI_SMALL); was x4plus
 
 
 def _frame_rgb_key(rel: str) -> tuple[np.ndarray, np.ndarray]:
@@ -2086,6 +2103,870 @@ def _frame_rgb_key(rel: str) -> tuple[np.ndarray, np.ndarray]:
     return pal[idx], idx == 0
 
 
+# Items (art/item: inventory icons, ground miniatures, paperdoll) with
+# remacri (2026-10-01, user: "candy"): remacri keeps the painted detail
+# but sharpens the 1x outline's stair-steps, so the outer ITEM_EDGE_BAND HD
+# px fade to the default model's smoother upscale (backed up once to
+# work/_item_default/). Per item, the sharper one wins: interior detail
+# (mean |laplacian| of luminance, alpha eroded 8 px) of the default version
+# over remacri's above ITEM_KEEP_RATIO keeps the default (38 of 810, e.g.
+# I_Geode's crystal facets, I_MetalCan). Remacri frames are staged in
+# work/_item_remacri/ (made by cmd_hd with that overlay root; --force
+# remakes them). The live alpha backups get the result, so hd-smooth-alpha
+# reruns keep it.
+ITEM_MODEL = "remacri-4x"
+ITEM_EDGE_BAND = 6.0
+ITEM_KEEP_RATIO = 1.0
+
+
+def _item_detail(a: np.ndarray, m: np.ndarray) -> float:
+    from scipy import ndimage
+    lum = ndimage.gaussian_filter(a[..., :3].mean(-1), 0.7)
+    return float(np.abs(ndimage.laplace(lum))[m].mean())
+
+
+def cmd_hd_item_remacri(only: str | None = None, force: bool = False, workers: int = 3) -> None:
+    cmd_hd_remacri_edge("item", only, force, workers, ITEM_KEEP_RATIO)
+
+
+# Creatures (critter / monster / unique_npc), 2026-10-01: user - remacri vs
+# the default model is a toss-up per character, so all of them go remacri +
+# smooth edge (no sharper-wins rule) with the default kept in
+# work/_<category>_default/ to revert any one in play (hd-remacri-revert).
+CREATURE_CATEGORIES = ("critter", "monster", "unique_npc")
+
+
+def cmd_hd_remacri_revert(category: str, names: list[str]) -> None:
+    for n in names:
+        src = config.WORK_DIR / f"_{category}_default" / n
+        dst = config.HD_OVERLAY_DIR / "art" / category / n
+        if not src.is_dir():
+            print(f"{category}/{n}: no default backup")
+            continue
+        for f in src.glob("r*_f*.png"):
+            shutil.copyfile(f, dst / f.name)
+        print(f"{category}/{n}: back to the default model")
+
+
+def cmd_hd_remacri_edge(category: str, only: str | None = None, force: bool = False, workers: int = 3,
+                        keep_ratio: float = float("inf")) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from scipy import ndimage
+    live_root = config.HD_OVERLAY_DIR / "art" / category
+    stage_root = config.WORK_DIR / f"_{category}_remacri"
+    default_root = config.WORK_DIR / f"_{category}_default"
+    # leaf art folders (creatures nest: critter/dfm/dfmbnsad/)
+    names = sorted({f.parent.relative_to(live_root).as_posix() for f in live_root.rglob("r*_f*.png")})
+    if only:
+        names = [n for n in names if only.lower() in n.lower()]
+
+    def stage(n: str) -> str | None:
+        if (stage_root / "art" / category / n).is_dir() and not force:
+            return None
+        live = config.HD_OVERLAY_DIR
+        try:
+            config.HD_OVERLAY_DIR = stage_root
+            cmd_hd(f"art/{category}/{n}.ART", model=ITEM_MODEL, force=True, quiet=True)
+        except Exception as e:  # noqa: BLE001
+            return f"{n}: {e}"
+        finally:
+            config.HD_OVERLAY_DIR = live
+        return None
+
+    # cmd_hd's alpha backups go next to the staged frames, not over the live ones
+    real_backup = globals()["alpha_backup_path"]
+    globals()["alpha_backup_path"] = lambda dest: (stage_root / "_alpha" / dest.relative_to(stage_root / "art")
+                                                   if stage_root in dest.parents else real_backup(dest))
+    try:
+        with ThreadPoolExecutor(workers) as ex:
+            for err in ex.map(stage, names):
+                if err:
+                    print("  stage failed:", err)
+        if not only:  # palette variants (r*_f*_p*.png) with remacri too, into the staging root
+            live = config.HD_OVERLAY_DIR
+            try:
+                config.HD_OVERLAY_DIR = stage_root
+                cmd_hd_palettes([category], model=ITEM_MODEL, force=force)
+            finally:
+                config.HD_OVERLAY_DIR = live
+    finally:
+        globals()["alpha_backup_path"] = real_backup
+    kept = used = 0
+    for n in names:
+        sdir, ldir, ddir = stage_root / "art" / category / n, live_root / n, default_root / n
+        if not sdir.is_dir():
+            continue
+        if not ddir.exists():
+            shutil.copytree(ldir, ddir)
+        # palette variants are staged by hd-palettes above; any that aren't stay as they are
+        frames = sorted(f for f in ddir.glob("r*_f*.png") if (sdir / f.name).exists())
+        outs, dets = [], [0.0, 0.0]
+        for f in frames:
+            cur = np.asarray(Image.open(f).convert("RGBA"), dtype=np.float32)
+            rf = sdir / f.name
+            if not rf.exists():
+                outs = None
+                break
+            rem = np.asarray(Image.open(rf).convert("RGBA"), dtype=np.float32)
+            if rem.shape != cur.shape:
+                outs = None
+                break
+            m = ndimage.binary_erosion(rem[..., 3] > 250, iterations=8)
+            if m.sum() >= 200:
+                dets[0] += _item_detail(cur, m)
+                dets[1] += _item_detail(rem, m)
+            w = np.clip(ndimage.distance_transform_edt(rem[..., 3] > 127) / ITEM_EDGE_BAND, 0, 1)[..., None]
+            out = rem.copy()
+            out[..., :3] = cur[..., :3] * (1 - w) + rem[..., :3] * w
+            outs.append((f.name, out))
+        if outs is None:
+            print(f"  {n}: staged frames don't match, left as is")
+            continue
+        if dets[1] > 0 and dets[0] / dets[1] > keep_ratio:
+            for f in frames:
+                shutil.copyfile(f, ldir / f.name)
+            kept += 1
+            continue
+        for name, out in outs:
+            dest = ldir / name
+            img = Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8), "RGBA")
+            img.save(dest, "PNG", compress_level=6)
+            bk = alpha_backup_path(dest)
+            sb = stage_root / "_alpha" / category / n / name
+            if bk.exists() and sb.exists():
+                raw = np.asarray(Image.open(sb).convert("RGBA")).copy()
+                raw[..., :3] = np.asarray(img)[..., :3]
+                Image.fromarray(raw, "RGBA").save(bk, "PNG", compress_level=6)
+        used += 1
+    print(f"{category}: {used} remacri + smooth edge, {kept} kept the default model (sharper)")
+
+
+# Round buttons (2026-10-01 audit, user: "smooth buttons and golden frames
+# without tiny black lines, jagginess, artifacts, keep the shade"; target:
+# the big green char-creation button). Per round button frame: the centre is
+# refined to the one that lines the rim's rings up best (most uneven rims
+# were just off-centre), the band from just inside the dark face line to the
+# outer edge is smoothed along the circle (ROUND_ARC_DEG; keeps the bevel's
+# light, drops specks and stair-steps, ROUND_DETAIL of the original kept),
+# and the outline becomes an anti-aliased circle at the measured edge. State
+# arts: every interface art whose alpha is a circle (ROUND_BUTTONS, found by
+# fit, not the AP lights or map markers). The same buttons painted into
+# panels (their resting state): ROUND_PANEL_SPOTS (panel, HD centre x, y,
+# radius), found by matching the state arts' rims into the panels (score
+# >= 0.93) plus IntBotom's four HUD sockets (circle fit); no outline change
+# there. Rebuilt from work/_round_originals/ every run.
+ROUND_ARC_DEG = 9.0
+ROUND_DETAIL = 0.2
+# Rims drawn as two copper rings with a dark line between (vanilla's bevel,
+# which reads as one circle splitting into two in HD): merged into one ring
+# (_rb_merge_rings). Arts by name; panel spots by matched radius (none of
+# the panels paints these).
+ROUND_MERGE = {"SkilAddBut", "SkilMinusBut", "SldrButt_L_Arrow", "SldrButt_R_Arrow"}
+ROUND_MERGE_SPOT_R: set[float] = set()
+ROUND_MERGE_GAP = 8.0
+ROUND_MERGE_FILL = 0.75
+ROUND_BUTTONS = [
+    "Anatomical_But", "BGRN_BUT", "Big_Grn_L", "Big_Grn_R", "BookmarkButt", "Char_HTFTMinus", "Char_HTFTPlus",
+    "Char_Minus", "Char_Plus", "Chemistry_But", "Combat_But", "Combat_Button", "CombineButt", "Electrical_But",
+    "Explosives_But", "GunSmithy_But", "Inven_lil_butt", "LilGrnBut", "MMB_Chest", "MMB_Note", "MMB_Ques",
+    "MMB_Skull", "MPCycleLeftButton", "MPCycleRightButton", "MPRefreshButton", "MP_BAN", "MP_KICK", "M_DnBut",
+    "M_UpBut", "MapTravelBut", "Mechanical_But", "PD_lil_butt", "S_Air", "S_Conveyance",
+    "S_Divination", "S_Earth", "S_EvilNecro", "S_Fire", "S_Forc", "S_GoodNecro", "S_Mental", "S_Meta", "S_Nature",
+    "S_Summoning", "S_Temporal", "S_Water", "Schematics_Button", "SkilAddBut", "SkilMinusBut", "Skills_Button",
+    "SldrButt_L_Arrow", "SldrButt_R_Arrow", "Sm_RightArrow", "Smithy_But", "Social_But", "Spells_Button",
+    "TakeAllButt", "Technological_But", "TextToggle", "Therapeutics_But", "Thieving_But", "UnBookmarkButt",
+    "char_Common_Skills", "char_Spells_Skills", "char_Tech_Skills", "s_morph", "s_phantasm", "tiny_butt",
+]
+ROUND_PANEL_SPOTS: list[tuple[str, float, float, float]] = [
+    ('Barter_Follower', 669.2, 269.3, 57.0),
+    ('Barter_Follower', 1061.2, 269.3, 57.0),
+    ('CharCreateBottomBar', 394.0, 334.0, 117.9),
+    ('CharCreateBottomBar', 2818.0, 334.0, 117.9),
+    ('CharRace_Base', 885.2, 1376.5, 76.0),
+    ('CharRace_Base', 1205.2, 1376.5, 76.0),
+    ('Char_Maint', 717.0, 506.0, 38.0),
+    ('Char_Maint', 717.0, 666.0, 38.0),
+    ('Char_Maint', 717.0, 826.0, 38.0),
+    ('Char_Maint', 717.0, 986.0, 38.0),
+    ('Char_Maint', 934.0, 506.0, 38.0),
+    ('Char_Maint', 934.0, 666.0, 38.0),
+    ('Char_Maint', 934.0, 826.0, 38.0),
+    ('Char_Maint', 934.0, 986.0, 38.0),
+    ('Char_Maint', 1289.0, 506.0, 38.0),
+    ('Char_Maint', 1289.0, 666.0, 38.0),
+    ('Char_Maint', 1289.0, 826.0, 38.0),
+    ('Char_Maint', 1289.0, 986.0, 38.0),
+    ('Char_Maint', 1506.0, 506.0, 38.0),
+    ('Char_Maint', 1506.0, 666.0, 38.0),
+    ('Char_Maint', 1506.0, 826.0, 38.0),
+    ('Char_Maint', 1506.0, 986.0, 38.0),
+    ('Char_Maint', 1678.5, 616.9, 33.0),
+    ('Char_Maint', 1678.5, 896.9, 33.0),
+    ('Char_Maint', 1900.3, 616.7, 33.0),
+    ('Char_Maint', 1900.3, 896.7, 33.0),
+    ('Char_Maint', 2187.3, 123.2, 78.6),
+    ('Char_Maint', 2459.3, 123.2, 78.6),
+    ('Char_Maint', 2731.3, 123.2, 78.6),
+    ('Combine_Rot', 1109.2, 168.5, 76.0),
+    ('CreateCharacterBase', 209.4, 1406.4, 41.6),
+    ('CreateCharacterBase', 210.9, 1004.2, 43.7),
+    ('CreateCharacterBase', 210.9, 1204.2, 43.7),
+    ('CreateCharacterBase', 229.2, 364.5, 76.0),
+    ('CreateCharacterBase', 1037.2, 364.5, 76.0),
+    ('CreateCharacterBase', 1066.9, 1008.2, 43.7),
+    ('CreateCharacterBase', 1066.9, 1208.2, 43.7),
+    ('CreateCharacterBase', 1066.9, 1408.2, 43.7),
+    ('IntBotom', 424.0, 142.0, 90.0),
+    ('IntBotom', 2676.0, 290.0, 90.0),
+    ('IntBotom', 2851.0, 470.0, 90.0),
+    ('IntBotom', 2852.0, 137.0, 94.0),
+    ('MPConnectionSettingsCover', 262.2, 1280.9, 61.4),
+    ('MPConnectionSettingsCover', 674.2, 1280.9, 61.4),
+    ('MPOptionsBackground', 265.2, 1349.3, 57.0),
+    ('MPOptionsBackground', 265.2, 1629.3, 57.0),
+    ('MPOptionsBackground', 1046.9, 1348.2, 43.7),
+    ('MPOptionsBackground', 1046.9, 1628.2, 43.7),
+    ('MPOptionsBackground', 1345.4, 934.4, 41.6),
+    ('MPOptionsBackground', 1349.2, 657.3, 57.0),
+    ('MPOptionsBackground', 1941.9, 2121.8, 101.6),
+    ('MPOptionsBackground', 2130.9, 656.2, 43.7),
+    ('MPOptionsBackground', 2130.9, 936.2, 43.7),
+    ('MPOptionsBackground', 2309.2, 657.3, 57.0),
+    ('MPOptionsBackground', 2309.2, 937.3, 57.0),
+    ('MPOptionsBackground', 2309.2, 1497.3, 57.0),
+    ('MPOptionsBackground', 2309.2, 1777.3, 57.0),
+    ('MPOptionsBackground', 3090.9, 656.2, 43.7),
+    ('MPOptionsBackground', 3090.9, 936.2, 43.7),
+    ('MPOptionsBackground', 3090.9, 1496.2, 43.7),
+    ('MPOptionsBackground', 3090.9, 1776.2, 43.7),
+    ('MP_KickBanRotWindow', 478.0, 250.0, 117.9),
+    ('MP_KickBanRotWindow', 1154.0, 250.0, 117.9),
+    ('MapMain', 2906.0, 1362.0, 117.9),
+    ('Mess_Rot', 1533.2, 128.9, 61.4),
+    ('Mess_Rot', 1533.2, 302.9, 61.4),
+    ('MpWt_Rot', 114.9, 332.2, 43.7),
+    ('MpWt_Rot', 402.2, 292.9, 61.4),
+    ('MpWt_Rot', 1322.2, 296.9, 61.4),
+    ('MultiMove_Base', 718.9, 272.2, 43.7),
+    ('MultiMove_Base', 1458.2, 120.9, 61.4),
+    ('MultiMove_Base', 1458.2, 324.9, 61.4),
+    ('PortName_Base', 2377.2, 1356.5, 76.0),
+    ('PortName_Base', 2749.2, 1356.5, 76.0),
+    ('PreGenCharacterBase', 229.2, 365.9, 61.4),
+    ('PreGenCharacterBase', 1037.2, 365.9, 61.4),
+    ('PrivMes_Window', 1566.9, 116.2, 43.7),
+    ('Schematic_Base', 189.2, 712.5, 76.0),
+    ('Schematic_Base', 189.2, 1064.5, 76.0),
+    ('Slp_Main', 145.2, 1036.5, 76.0),
+    ('Slp_Main', 421.2, 1036.5, 76.0),
+    ('intrface', 430.9, 76.2, 43.7),
+    ('intrface', 645.2, 2288.5, 76.0),
+    ('intrface', 2569.2, 2288.5, 76.0),
+    ('intrface', 2723.4, 74.4, 41.6),
+    ('intrface', 2813.2, 2288.5, 76.0),
+]
+# Round buttons inside a bigger art (the worldmap's green map buttons: left part of the art)
+ROUND_ART_SPOTS = [("MapWholeBut", 85.0, 112.0, 76.0), ("MapZoomBut", 80.0, 107.0, 78.0)]
+
+
+def _rb_pol(img, cx, cy, R, T):
+    from scipy import ndimage
+    return ndimage.map_coordinates(img, [cy + R * np.sin(T) - 0.5, cx + R * np.cos(T) - 0.5], order=1, mode="nearest")
+
+
+def _rb_fit(alpha: np.ndarray) -> tuple[float, float, float]:
+    m = alpha > 127
+    ys, xs = np.nonzero(m)
+    return xs.mean() + 0.5, ys.mean() + 0.5, float(np.sqrt(m.sum() / np.pi))
+
+
+def _rb_merge_rings(a: np.ndarray, cx: float, cy: float, inner: float, outer: float) -> np.ndarray:
+    """Per angle, a radial grey closing over inner..outer: a dark line
+    narrower than ROUND_MERGE_GAP HD px between two bright rings is filled
+    with the brighter ring's colour, so the rim reads as one ring."""
+    from scipy import ndimage
+    dr, nt = 0.25, 2048
+    gap = int(ROUND_MERGE_GAP / dr)
+    R = np.arange(inner - ROUND_MERGE_GAP, outer + 2, dr)
+    T = np.linspace(0, 2 * np.pi, nt, endpoint=False)
+    pol = np.stack([_rb_pol(a[..., c], cx, cy, R[:, None], T[None, :]) for c in range(a.shape[2])], -1)
+    al = pol[..., 3] / 255 if a.shape[2] == 4 else 1.0
+    lum = pol[..., :3].mean(-1) * al
+    closed = ndimage.grey_closing(lum, size=(gap, 1))
+    win = np.lib.stride_tricks.sliding_window_view(np.pad(lum, ((gap // 2, gap - 1 - gap // 2), (0, 0)), mode="edge"), gap, 0)
+    rows = np.clip(np.arange(len(R))[:, None] + np.argmax(win, -1) - gap // 2, 0, len(R) - 1)
+    hue = np.take_along_axis(pol[..., :3], rows[..., None].repeat(3, -1), 0)
+    hue = hue / np.maximum(hue.mean(-1, keepdims=True), 1)
+    filled = (closed > lum + 1)[..., None]
+    new = np.where(filled, hue * (lum + ROUND_MERGE_FILL * (closed - lum))[..., None], pol[..., :3])
+    h, w = a.shape[:2]
+    yy, xx = np.mgrid[:h, :w].astype(np.float32) + 0.5
+    rr = np.hypot(xx - cx, yy - cy)
+    band = (rr >= inner) & (rr <= outer)
+    ri = (rr[band] - R[0]) / dr
+    ti = np.mod(np.arctan2(yy[band] - cy, xx[band] - cx), 2 * np.pi) / (2 * np.pi) * nt
+    out = a.copy()
+    for c in range(3):
+        out[..., c][band] = ndimage.map_coordinates(np.pad(new[..., c], ((0, 0), (0, 1)), mode="wrap"), [ri, ti], order=1, mode="nearest")
+    return out
+
+
+def _rb_regularise(a: np.ndarray, cx: float, cy: float, r: float, use_alpha: bool, merge: bool = False) -> np.ndarray:
+    from scipy import ndimage
+    lum = ndimage.gaussian_filter(a[..., :3].mean(-1), 1.0)
+    R = np.arange(0.6 * r, r + 1, 0.5)[:, None]
+    T = np.linspace(0, 2 * np.pi, 360, endpoint=False)[None, :]
+    best = None
+    for dx in np.arange(-4, 4.01, 0.5):
+        for dy in np.arange(-4, 4.01, 0.5):
+            sc = np.abs(np.diff(_rb_pol(lum, cx + dx, cy + dy, R, T).mean(1))).sum()
+            if best is None or sc > best[0]:
+                best = (sc, cx + dx, cy + dy)
+    _, cx, cy = best
+    T = np.linspace(0, 2 * np.pi, 720, endpoint=False)[None, :]
+    R = np.arange(0.5 * r, r + 6, 0.25)[:, None]
+    P = _rb_pol(a[..., :3].mean(-1), cx, cy, R, T).mean(1)
+    if use_alpha:
+        e0 = float(R[np.argmin(np.abs(_rb_pol(a[..., 3], cx, cy, R, T).mean(1) - 127.5)), 0])
+    else:
+        e0 = r
+    ok = (R[:, 0] < e0 - 3) & (R[:, 0] > 0.55 * r)
+    g0 = float(R[ok, 0][np.argmin(P[ok])])
+    if merge:
+        a = _rb_merge_rings(a, cx, cy, g0 + 2, e0 - 1.5)
+    h, w = a.shape[:2]
+    R1 = e0 + 4
+    y0, y1 = max(int(cy - R1 - 2), 0), min(int(cy + R1 + 3), h)
+    x0, x1 = max(int(cx - R1 - 2), 0), min(int(cx + R1 + 3), w)
+    yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float32) + 0.5
+    rr = np.hypot(xx - cx, yy - cy)
+    th = np.arctan2(yy - cy, xx - cx)
+    band = np.clip((rr - (g0 - 5)) / 3, 0, 1) * np.clip((R1 - rr) / 2, 0, 1)
+    if not use_alpha:
+        band = band * np.clip((e0 + 2 - rr) / 3, 0, 1)   # panels: stop at the rim, the wood stays
+    sig = np.radians(ROUND_ARC_DEG)
+    acc, ws = 0.0, 0.0
+    for sft in np.linspace(-2.5 * sig, 2.5 * sig, 31):
+        wgt = np.exp(-0.5 * (sft / sig) ** 2)
+        X, Y = cx + rr * np.cos(th + sft) - 0.5, cy + rr * np.sin(th + sft) - 0.5
+        acc = acc + wgt * np.stack([ndimage.map_coordinates(a[..., c], [Y, X], order=1, mode="nearest")
+                                    for c in range(a.shape[2])], -1)
+        ws += wgt
+    smooth = acc / ws
+    reg = a[y0:y1, x0:x1]
+    rim = smooth + ROUND_DETAIL * (reg - smooth)
+    out = a.copy()
+    out[y0:y1, x0:x1] = reg * (1 - band[..., None]) + rim * band[..., None]
+    if use_alpha:
+        al = np.clip(e0 + 0.5 - rr, 0, 1) * 255
+        out[y0:y1, x0:x1, 3] = np.where(rr > g0, al, out[y0:y1, x0:x1, 3])
+    return np.clip(out, 0, 255)
+
+
+def _rb_backup(name: str) -> tuple[Path, Path]:
+    out_dir = hd_out_dir(f"art/interface/{name}.ART")
+    backup = config.WORK_DIR / "_round_originals" / name
+    if not backup.exists():
+        shutil.copytree(out_dir, backup)
+    return out_dir, backup
+
+
+def cmd_hd_round_buttons(only: str | None = None) -> None:
+    for name in ROUND_BUTTONS:
+        if only is not None and only.lower() not in name.lower():
+            continue
+        out_dir, backup = _rb_backup(name)
+        for src in sorted(backup.glob("r*_f*.png")):
+            a = np.asarray(Image.open(src).convert("RGBA"), dtype=np.float32)
+            cx, cy, r = _rb_fit(a[..., 3])
+            out = _rb_regularise(a, cx, cy, r, True, name in ROUND_MERGE)
+            Image.fromarray((out + 0.5).astype(np.uint8), "RGBA").save(out_dir / src.name)
+        print(f"{name}: rims smoothed" + (" (rings merged)" if name in ROUND_MERGE else ""))
+    for name, cx, cy, r in ROUND_ART_SPOTS:
+        if only is not None and only.lower() not in name.lower():
+            continue
+        out_dir, backup = _rb_backup(name)
+        for src in sorted(backup.glob("r*_f*.png")):
+            a = np.asarray(Image.open(src).convert("RGBA"), dtype=np.float32)
+            out = _rb_regularise(a, cx, cy, r, False)
+            Image.fromarray((out + 0.5).astype(np.uint8), "RGBA").save(out_dir / src.name)
+        print(f"{name}: button rim smoothed")
+    panels: dict[str, list] = {}
+    for p, cx, cy, r in ROUND_PANEL_SPOTS:
+        panels.setdefault(p, []).append((cx, cy, r))
+    for p, spots in panels.items():
+        if only is not None and only.lower() not in p.lower():
+            continue
+        out_dir, backup = _rb_backup(p)
+        a = np.asarray(Image.open(backup / "r0_f0.png").convert("RGBA"), dtype=np.float32)
+        for cx, cy, r in spots:
+            a = _rb_regularise(a, cx, cy, r, False, r in ROUND_MERGE_SPOT_R)
+        Image.fromarray((a + 0.5).astype(np.uint8), "RGBA").save(out_dir / "r0_f0.png")
+        print(f"{p}: {len(spots)} painted button rim(s) smoothed")
+
+
+# Buttons whose vanilla art shades with a pixel checkerboard (hover/press
+# glows, the key/gear/swap bodies). Upscalers turn the checkerboard into
+# stripes or mush, and the shapes came out different in every frame. Each
+# frame is split at 1x into the 50/50 average (upscaled with DITHER_MODEL)
+# and the checkerboard's half-difference, drawn back on as a hand-made
+# HD checker: one 4x4 HD cell per vanilla pixel, soft-cornered
+# (DITHER_HARDNESS: 1 = round dots, ~8 = hard squares). Only the dithered
+# areas (plus DITHER_GROW vanilla px) are replaced; rims, matte and
+# backgrounds stay as they were. Rebuilt from work/_dither_originals/ every
+# run; writes the round buttons' base (work/_round_originals/), so run
+# hd-round-buttons after it.
+DITHER_MODEL = "ultrasharp-4x"
+DITHER_HARDNESS = 1.0
+DITHER_GROW = 1
+DITHER_COHERENCE = 0.5
+DITHER_MIN_REGION = 16
+DITHER_BUTTONS = (
+    "BackBut NextBut Big_Grn_L Big_Grn_R Cler_Big cncl_big done_big TakeAllButt M_UpBut M_DnBut "
+    "Combat_Button Skills_Button Spells_Button Schematics_Button char_Common_Skills char_Spells_Skills "
+    "char_Tech_Skills SkilAddBut SkilMinusBut SldrButt_L_Arrow SldrButt_R_Arrow Sm_RightArrow "
+    "SpellTech_Add SpellTech_Minus MPly_AddBut MPly_KickBut MP_BAN MP_KICK MultiPlay_UP MultiPlay_DWN "
+    "MagickWeapon_Butt MapWholeBut MapZoomBut HKTshOFF Char_HTFTMinus Char_HTFTPlus"
+).split()
+
+
+def _dg_decompose(rgb: np.ndarray, key: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """1x frame -> (50/50 average, even-minus-odd half difference, region)."""
+    from scipy import ndimage
+    f = rgb.astype(np.float32)
+    p = np.pad(f, ((1, 1), (1, 1), (0, 0)), mode="edge")
+    kp = np.pad(key, 1, mode="edge")
+    s = np.zeros_like(f)
+    c = np.zeros(f.shape[:2], np.float32)
+    for nb, k in ((p[:-2, 1:-1], kp[:-2, 1:-1]), (p[2:, 1:-1], kp[2:, 1:-1]),
+                  (p[1:-1, :-2], kp[1:-1, :-2]), (p[1:-1, 2:], kp[1:-1, 2:])):
+        s += nb * (~k)[..., None]
+        c += ~k
+    n = s / np.maximum(c, 1)[..., None]
+    yy, xx = np.mgrid[:f.shape[0], :f.shape[1]]
+    sgn = np.where((xx + yy) % 2 == 0, 1.0, -1.0)[..., None]
+    half = (f - n) / 2 * sgn
+    # where two dithered areas meet (key on shield) a pixel's neighbours
+    # mix both: clamp its amplitude to the local median (no zipper)
+    med = ndimage.median_filter(np.abs(half), size=(5, 5, 1))
+    half = np.clip(half, -1.5 * med - 2, 1.5 * med + 2)
+    # a checkerboard keeps the parity-signed difference's sign over its
+    # 3x3 neighbourhood; a gradient or an edge does not
+    box = lambda x: ndimage.uniform_filter(x, 3, mode="nearest")
+    hm = np.abs(half).max(-1)
+    lead = np.argmax(np.abs(box(half)), -1)
+    hs = np.take_along_axis(half, lead[..., None], -1)[..., 0]
+    coh = np.abs(box(hs)) / (box(np.abs(hs)) + 1e-3)
+    reg = (coh > DITHER_COHERENCE) & (box(hm) > 3) & ~key
+    reg = ndimage.binary_opening(reg, np.ones((2, 2))) | (reg & (dither_weight(rgb, key) > 0))
+    reg = ndimage.binary_fill_holes(ndimage.binary_closing(reg, np.ones((3, 3)))) & ~key & (hm > 2)
+    lab, nl = ndimage.label(reg)
+    if nl:
+        sizes = ndimage.sum(reg, lab, range(1, nl + 1))
+        reg = np.isin(lab, 1 + np.nonzero(sizes >= DITHER_MIN_REGION)[0])
+    w = reg[..., None].astype(np.float32)
+    return f * (1 - w) + (f + n) / 2 * w, half * w, reg
+
+
+def _dg_up(a: np.ndarray) -> np.ndarray:
+    """Smooth (bicubic) x4 of a float HxW or HxWxC array."""
+    h, w = a.shape[:2]
+    if a.ndim == 2:
+        return np.asarray(Image.fromarray(a.astype(np.float32), "F").resize((w * HD_SCALE, h * HD_SCALE), Image.BICUBIC))
+    return np.stack([_dg_up(a[..., c]) for c in range(a.shape[2])], -1)
+
+
+def _dg_checker(h: int, w: int) -> np.ndarray:
+    """+1 on even vanilla pixels, -1 on odd, soft-cornered (DITHER_HARDNESS)."""
+    yy, xx = np.mgrid[:h, :w].astype(np.float32)
+    su = np.clip(DITHER_HARDNESS * np.sin(np.pi * (xx + 0.5) / HD_SCALE), -1, 1)
+    sv = np.clip(DITHER_HARDNESS * np.sin(np.pi * (yy + 0.5) / HD_SCALE), -1, 1)
+    return su * sv
+
+
+# Round ones of those get their whole face (inside the rim's dark groove)
+# rebuilt the same way, with the icon centred on the face afterwards:
+# one HD shift from the up (0) + hover (2) icons, applied to every frame, so
+# the down frame (1) keeps vanilla's press shift. The rim is kept.
+DITHER_FACE = set(
+    "Skills_Button Spells_Button Schematics_Button Combat_Button char_Common_Skills char_Spells_Skills "
+    "char_Tech_Skills SkilAddBut SkilMinusBut SldrButt_L_Arrow SldrButt_R_Arrow Sm_RightArrow Big_Grn_L "
+    "Big_Grn_R M_UpBut M_DnBut MultiPlay_UP MultiPlay_DWN Cler_Big cncl_big done_big BackBut NextBut "
+    "TakeAllButt MP_BAN MP_KICK MagickWeapon_Butt Char_HTFTMinus Char_HTFTPlus".split()
+)
+# Face circles (HD px in the art box) of the panel-cut buttons, measured on
+# the host panel's own ring at the button's spot (the art's leftover rim
+# pieces bias a fit on the art itself); the HP/fatigue +/- knobs use their
+# vanilla 21x21 art (bold sign) on the Char_Maint knob's face.
+FACE_CIRCLE = {
+    "SkilAddBut": (53.0, 57.0, 48.3),
+    "SkilMinusBut": (54.5, 56.7, 47.3),
+    "SldrButt_L_Arrow": (54.5, 57.0, 47.3),
+    "SldrButt_R_Arrow": (53.0, 57.0, 48.6),
+    "Cler_Big": (67.5, 70.8, 67.8),
+    "cncl_big": (67.0, 70.3, 67.8),
+    "done_big": (67.0, 70.3, 67.8),
+    "MMB_Chest": (41.5, 40.1, 40.1),
+    "MMB_Note": (41.5, 41.6, 40.6),
+    "MMB_Skull": (43.0, 39.1, 40.1),
+    "Sm_RightArrow": (45.5, 44.5, 40.5),
+    "MultiPlay_UP": (53.9, 52.5, 40.6),
+    "MultiPlay_DWN": (53.9, 52.7, 40.4),
+    "M_UpBut": (73.6, 70.0, 58.2),
+    "M_DnBut": (73.6, 70.0, 58.2),
+    "MP_BAN": (113.5, 116.5, 109.0),
+    "MP_KICK": (113.5, 116.5, 109.0),
+    "Char_Minus": (38.0, 37.0, 21.0),
+    "Char_Plus": (41.5, 37.5, 21.3),
+    "Char_HTFTMinus": (46.0, 43.4, 23.4),
+    "Char_HTFTPlus": (46.4, 43.6, 23.7),
+    "Big_Grn_L": (57.7, 57.9, 55.9),
+    "Big_Grn_R": (58.9, 57.9, 56.5),
+    "BGRN_BUT": (71.7, 71.2, 57.2),
+    "LilGrnBut": (41.9, 42.7, 40.6),
+    "tiny_butt": (53.2, 48.3, 40.5),
+}
+# The key buttons draw the same key: the shield variant takes the HUD
+# button's key (vanilla's has the shield's dithered highlight showing
+# between its teeth) on a rebuilt shield (_dg_shield_mask: one convex shape,
+# its checker carried on under the old key).
+DITHER_KEY_DONOR = {"char_Common_Skills": "Skills_Button"}
+ICON_DOWN_FRAME = 1
+# The resting key read washed out (vanilla's dim dither, upscaled): it is
+# the hover key's crisp checker, dimmed to the resting tone (vanilla's up
+# key is 0.58 of the hover one). The shield variant takes it via the donor.
+KEY_UP_FROM_HOVER = {"Skills_Button"}
+KEY_HOVER_FRAME = 2
+KEY_UP_DIM = 0.7
+ICON_NO_SHIFT = {"MP_BAN"}  # its faint up-frame ring isn't found whole
+
+
+def _dg_frames(name: str) -> list[tuple[int, int, np.ndarray, np.ndarray]]:
+    wd = cmd_unpack(f"art/interface/{name}.ART", quiet=True)
+    num_frames, animated = read_ini_frame_count(wd / (name + ".ini"))
+    out = []
+    for rot, frame, bmp in hd_frame_bmps(wd, name, num_frames, animated):
+        w, h = read_bmp_dims(bmp)
+        h = abs(h)
+        idx = np.asarray(read_bmp_indices(bmp), dtype=np.uint8).reshape(h, w)
+        pal = np.asarray(read_bmp_palette(bmp), dtype=np.uint8).reshape(256, 3)
+        out.append((rot, frame, pal[idx].astype(np.float32), idx == 0))
+    if name in KEY_UP_FROM_HOVER and len(out) > KEY_HOVER_FRAME:
+        r0, f0, c0, k0 = out[0]
+        ch = out[KEY_HOVER_FRAME][2]
+        m = _dg_keymask(ch, out[KEY_HOVER_FRAME][3]) & ~k0
+        c0 = c0.copy()
+        c0[m] = ch[m] * KEY_UP_DIM
+        out[0] = (r0, f0, c0, k0)
+    return out
+
+
+def _dg_fill(rgb: np.ndarray, hole: np.ndarray, iters: int = 400) -> np.ndarray:
+    """Harmonic fill of `hole` from its surroundings (smooth disc shading)."""
+    out = rgb.copy()
+    if not hole.any() or hole.all():
+        return out
+    out[hole] = rgb[~hole].mean(0)
+    for _ in range(iters):
+        p = np.pad(out, ((1, 1), (1, 1), (0, 0)), mode="edge")
+        avg = (p[:-2, 1:-1] + p[2:, 1:-1] + p[1:-1, :-2] + p[1:-1, 2:]) / 4
+        out[hole] = avg[hole]
+    return out
+
+
+def _dg_face(a: np.ndarray) -> tuple[float, float, float]:
+    """HD frame -> face centre and the radius of the rim's dark groove."""
+    from scipy import ndimage
+    m = a[..., 3] > 127
+    m = ndimage.binary_opening(m, np.ones((15, 15)))  # drop crescents / corner leftovers
+    ys, xs = np.nonzero(m)
+    cx, cy, r = xs.mean() + 0.5, ys.mean() + 0.5, float(np.sqrt(m.sum() / np.pi))
+    lum = ndimage.gaussian_filter(a[..., :3].mean(-1), 1.0)
+    R = np.arange(0.6 * r, r + 1, 0.5)[:, None]
+    T = np.linspace(0, 2 * np.pi, 360, endpoint=False)[None, :]
+    best = None
+    for dx in np.arange(-6, 6.01, 0.5):
+        for dy in np.arange(-6, 6.01, 0.5):
+            sc = np.abs(np.diff(_rb_pol(lum, cx + dx, cy + dy, R, T).mean(1))).sum()
+            if best is None or sc > best[0]:
+                best = (sc, cx + dx, cy + dy)
+    _, cx, cy = best
+    R = np.arange(0.5 * r, r + 2, 0.25)[:, None]
+    prof = _rb_pol(a[..., :3].mean(-1), cx, cy, R, np.linspace(0, 2 * np.pi, 720, endpoint=False)[None, :]).mean(1)
+    ok = (R[:, 0] > 0.55 * r) & (R[:, 0] < r - 2)
+    return cx, cy, float(R[ok, 0][np.argmin(prof[ok])])
+
+
+def _dg_icon(rgb: np.ndarray, key: np.ndarray, cx: float, cy: float, g0: float) -> np.ndarray:
+    """1x mask of the face's icon (with its outline / drop shadow)."""
+    from scipy import ndimage
+    h, w = key.shape
+    yy, xx = np.mgrid[:h, :w] + 0.5
+    face = (np.hypot(xx - cx, yy - cy) < g0 - 1.0) & ~key
+    if not face.any():
+        return np.zeros_like(key)
+    avg, _, reg = _dg_decompose(rgb, key)
+    mx, mn = avg.max(-1), avg.min(-1)
+    sat = (mx - mn) / np.maximum(mx, 1)
+    med = np.median(avg[face], 0)
+    cand = face & (reg | (np.abs(avg - med).max(-1) > 45))
+    cand &= ~((sat < 0.3) & (avg.mean(-1) > med.mean() + 30))  # rim highlights
+    for _ in range(2):
+        disc = _dg_fill(avg, cand | ~face, 200)
+        cand = face & (np.abs(avg - disc).max(-1) > 28)
+        cand &= ~((sat < 0.3) & (avg.mean(-1) > disc.mean(-1) + 30))
+        nb = ndimage.convolve(cand.astype(np.int32), np.ones((3, 3), np.int32), mode="constant") - cand
+        cand &= (nb >= 1) | reg  # drop lone specks only (a minus sign is 1 px tall)
+    lab, n = ndimage.label(ndimage.binary_closing(cand, np.ones((3, 3))) & face)
+    if not n:
+        return np.zeros_like(key)
+    sizes = ndimage.sum(lab > 0, lab, range(1, n + 1))
+    keep = np.isin(lab, 1 + np.nonzero(sizes >= max(4, 0.15 * sizes.max()))[0])
+    return ndimage.binary_dilation(keep, np.ones((3, 3))) & face
+
+
+def _dg_move(rgb: np.ndarray, key: np.ndarray, icon: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    if dx == 0 and dy == 0:
+        return rgb
+    out = _dg_fill(rgb, icon & ~key, 400)
+    src = np.roll(np.roll(rgb, dy, 0), dx, 1)
+    dst = np.roll(np.roll(icon, dy, 0), dx, 1) & ~key
+    out[dst] = src[dst]
+    return out
+
+
+def _dg_keymask(c: np.ndarray, k: np.ndarray) -> np.ndarray:
+    """1x mask of a key's gold body (yellow; not the pink/white shield)."""
+    from scipy import ndimage
+    r_, g_, b_ = c[..., 0], c[..., 1], c[..., 2]
+    gold = (r_ > 60) & (g_ > 0.72 * r_) & (g_ < 1.2 * r_) & (b_ < 0.6 * r_) & ~k
+    lab, n = ndimage.label(ndimage.binary_closing(gold, np.ones((2, 2))))
+    if n:
+        sizes = ndimage.sum(lab > 0, lab, range(1, n + 1))
+        gold = lab == 1 + int(np.argmax(sizes))
+    # solid: the dark cells of its checker and the keyhole belong to it
+    return ndimage.binary_fill_holes(ndimage.binary_closing(gold, np.ones((2, 2)))) & ~k
+
+
+def _dg_fill_in(img: np.ndarray, hole: np.ndarray, domain: np.ndarray, iters: int = 400) -> np.ndarray:
+    """Harmonic fill of `hole` using only neighbours inside `domain`."""
+    out = img.copy()
+    known = domain & ~hole
+    if not hole.any() or not known.any():
+        return out
+    out[hole] = img[known].mean(0)
+    d = np.pad(domain, 1).astype(np.float32)
+    for _ in range(iters):
+        p = np.pad(out, ((1, 1), (1, 1), (0, 0)))
+        acc = np.zeros_like(out)
+        cnt = np.zeros(out.shape[:2], np.float32)
+        for sy, sx in ((0, 1), (2, 1), (1, 0), (1, 2)):
+            w = d[sy:sy + out.shape[0], sx:sx + out.shape[1]]
+            acc += p[sy:sy + out.shape[0], sx:sx + out.shape[1]] * w[..., None]
+            cnt += w
+        upd = acc / np.maximum(cnt, 1)[..., None]
+        out[hole] = upd[hole]
+    return out
+
+
+def _dg_shield_mask(frames: list) -> np.ndarray:
+    """The shield as one convex shape: hull of its red pixels in every frame."""
+    import cv2
+    red = np.zeros(frames[0][3].shape, bool)
+    for _, _, c, k in frames:
+        red |= (c[..., 0] > c[..., 1] * 1.35) & (c[..., 0] > c[..., 2] * 1.2) & (c[..., 0] > 60) & ~k
+    ys, xs = np.nonzero(red)
+    hull = cv2.convexHull(np.stack([xs, ys], 1).astype(np.int32))
+    m = np.zeros(red.shape, np.uint8)
+    cv2.fillConvexPoly(m, hull, 1)
+    return m.astype(bool)
+
+
+def _dg_key_donor(rgb: np.ndarray, key: np.ndarray, donor: np.ndarray, dkey: np.ndarray,
+                  shield: np.ndarray) -> np.ndarray:
+    """The donor's key (gold body + dark outline) on a clean shield: the
+    shield's own checker (average and half-difference filled separately
+    inside the shield shape, so the dither carries on under the old key and
+    the light strip between the teeth goes), the disc around it, then the
+    key, aligned on the two keys' bounding boxes."""
+    from scipy import ndimage
+    mk = _dg_keymask(rgb, key)
+    # the donor key: its whole dithered area (body, teeth, the shading under it)
+    dreg = _dg_decompose(donor, dkey)[2]
+    lab, n = ndimage.label(dreg)
+    area = ndimage.binary_fill_holes(lab == 1 + int(np.argmax(ndimage.sum(dreg, lab, range(1, n + 1)))))
+    # ... minus the shading band under it: the key is what's brighter than the disc
+    davg = _dg_decompose(donor, dkey)[0]
+    disc_under = _dg_fill(davg, ndimage.binary_dilation(area, np.ones((3, 3)), iterations=2) | dkey, 300)
+    md = area & (davg.mean(-1) > disc_under.mean(-1) + 12)
+    md = ndimage.binary_fill_holes(ndimage.binary_closing(md, np.ones((2, 2)))) & area
+    ys, xs = np.nonzero(mk)
+    yd, xd = np.nonzero(md)
+    dx = int(round((xs.min() + xs.max() - xd.min() - xd.max()) / 2))
+    dy = int(round((ys.min() + ys.max() - yd.min() - yd.max()) / 2))
+    # the key's own dark outline: darker than the donor's disc would be there
+    body = ndimage.binary_dilation(md, np.ones((3, 3))) & ~md
+    under = _dg_fill(_dg_decompose(donor, dkey)[0], ndimage.binary_dilation(md, np.ones((3, 3)), iterations=2) | dkey, 300)
+    dark = body & (donor.mean(-1) < under.mean(-1) - 18)
+    take = np.roll(np.roll(md | dark, dy, 0), dx, 1) & ~key
+    src = np.roll(np.roll(donor, dy, 0), dx, 1)
+    avg, half, _ = _dg_decompose(rgb, key)
+    red = (rgb[..., 0] > rgb[..., 1] * 1.35) & (rgb[..., 0] > rgb[..., 2] * 1.2) & (rgb[..., 0] > 60) & ~key
+    core = ndimage.binary_erosion(shield, np.ones((3, 3)))
+    known_s = red & core & ~ndimage.binary_dilation(mk, np.ones((3, 3)), iterations=2)
+    hole_s = shield & ~known_s
+    s_avg = _dg_fill_in(avg, hole_s, shield)
+    s_half = _dg_fill_in(half, hole_s, shield)
+    yy, xx = np.mgrid[:key.shape[0], :key.shape[1]]
+    sgn = np.where((xx + yy) % 2 == 0, 1.0, -1.0)[..., None]
+    disc = ~shield & ~key
+    old = ndimage.binary_dilation(mk | (rgb.mean(-1) > 150), np.ones((3, 3)), iterations=2) & disc
+    d_avg = _dg_fill_in(avg, old, disc)
+    out = np.where(shield[..., None], s_avg + s_half * sgn, np.where(old[..., None], d_avg, rgb))
+    out[take] = src[take]
+    return np.clip(out, 0, 255)
+
+
+def cmd_hd_dither_buttons(only: str | None = None) -> None:
+    import cv2
+    from scipy import ndimage
+    stage = config.WORK_DIR / "_dither_buttons"
+    stage.mkdir(parents=True, exist_ok=True)
+    for name in DITHER_BUTTONS:
+        if only is not None and only.lower() != name.lower():
+            continue
+        rel = f"art/interface/{name}.ART"
+        out_dir = hd_out_dir(rel)
+        rb = config.WORK_DIR / "_round_originals" / name
+        base_dir = config.WORK_DIR / "_dither_originals" / name
+        if not base_dir.exists():
+            shutil.copytree(rb if rb.exists() else out_dir, base_dir)
+        frames = _dg_frames(name)
+        if name in DITHER_KEY_DONOR:
+            donor = {f: (c, k) for _, f, c, k in _dg_frames(DITHER_KEY_DONOR[name])}
+            shield = _dg_shield_mask(frames)
+            frames = [(r, f, _dg_key_donor(c, k, *donor[f], shield), k) for r, f, c, k in frames]
+        face = None
+        shifts: dict[int, tuple[int, int]] = {}
+        if name in DITHER_FACE:
+            b0 = np.asarray(Image.open(base_dir / f"r{frames[0][0]}_f{frames[0][1]}.png").convert("RGBA"), dtype=np.float32)
+            fx, fy, fg = FACE_CIRCLE.get(name) or _dg_face(b0)
+            face = (fx / HD_SCALE, fy / HD_SCALE, fg / HD_SCALE)
+            icons = {f: _dg_icon(c, k, *face) for r, f, c, k in frames}
+            every = np.zeros_like(frames[0][3])
+            ref = np.zeros_like(every)
+            for (r, f, c, k) in frames:
+                icon = icons[f]
+                every |= icon
+                if f != ICON_DOWN_FRAME or len(icons) == 1:
+                    # centred on the coloured body, not its bevel shadow; up
+                    # and hover share the icon, so the clearer (bigger) of
+                    # the two (the lit hover; the dark up frame can lose it)
+                    av = _dg_decompose(c, k)[0]
+                    mx, mn = av.max(-1), av.min(-1)
+                    sat = (mx - mn) / np.maximum(mx, 1)
+                    body = icon & (sat > 0.4)
+                    body = body if body.sum() >= 4 else icon
+                    if body.sum() > ref.sum():
+                        ref = body
+        built = []
+        for rot, frame, rgb, key in frames:
+            h, w = key.shape
+            base = np.asarray(Image.open(base_dir / f"r{rot}_f{frame}.png").convert("RGBA"), dtype=np.float32)
+            avg, half, reg = _dg_decompose(rgb, key)
+            if not reg.any() and face is None:
+                continue
+            src = np.clip(inpaint_colorkey(avg, key) + 0.5, 0, 255).astype(np.uint8)
+            pw, ph = max(0, BUTTON_MIN_SIDE - w), max(0, BUTTON_MIN_SIDE - h)
+            padded = np.pad(src, ((ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2), (0, 0)), mode="edge")
+            src_png = stage / f"{name}_{rot}_{frame}.png"
+            hd_png = stage / f"{name}_{rot}_{frame}_x4.png"
+            Image.fromarray(padded, "RGB").save(src_png)
+            run_esrgan(src_png, hd_png, DITHER_MODEL)
+            hd = load_and_validate(hd_png, (padded.shape[1] * HD_SCALE, padded.shape[0] * HD_SCALE), "hd-dither-buttons")
+            x0, y0 = pw // 2 * HD_SCALE, ph // 2 * HD_SCALE
+            hd = np.asarray(hd.convert("RGB").crop((x0, y0, x0 + w * HD_SCALE, y0 + h * HD_SCALE)), dtype=np.float32)
+            corr = structural_corr(src, np.asarray(Image.fromarray(hd.astype(np.uint8)).resize((w, h), Image.BOX)), ~key)
+            if corr < BATCH_OUTPUT_MIN_CORR:
+                raise RuntimeError(f"{DITHER_MODEL} output doesn't match {name} f{frame} (corr {corr:.2f})")
+            new = hd + _dg_up(half) * _dg_checker(h * HD_SCALE, w * HD_SCALE)[..., None]
+            if face is not None:
+                yy, xx = np.mgrid[:h * HD_SCALE, :w * HD_SCALE] + 0.5
+                rr = np.hypot(xx - fx, yy - fy)
+                m = np.clip((fg - 2 - rr) / 3, 0, 1)[..., None]
+            else:
+                grown = ndimage.binary_dilation(reg, np.ones((3, 3)), iterations=DITHER_GROW) & ~key
+                m = np.clip(_dg_up(ndimage.gaussian_filter(grown.astype(np.float32), 0.5)) * 1.5, 0, 1)[..., None]
+            out = base.copy()
+            out[..., :3] = base[..., :3] * (1 - m) + np.clip(new, 0, 255) * m
+            built.append((rot, frame, out))
+        if face is not None and ref.any():
+            # icon centred at HD precision: one shift from the up + hover
+            # icons' box (soft-upscaled 1x masks), applied to every frame so
+            # the down frame keeps vanilla's press shift
+            ys, xs = np.nonzero(_dg_up(ref.astype(np.float32)) > 0.5)
+            sh = (0, 0) if name in ICON_NO_SHIFT else (int(round(fx - (xs.min() + xs.max() + 1) / 2)), int(round(fy - (ys.min() + ys.max() + 1) / 2)))
+            shifts = {f: sh for _, f, _ in built}
+            if sh != (0, 0):
+                region = ndimage.binary_dilation(every, np.ones((3, 3)), iterations=2)  # + bevel shadows
+                soft = np.clip(_dg_up(ndimage.gaussian_filter(region.astype(np.float32), 0.6)) * 1.4, 0, 1)
+                hole = (ndimage.binary_dilation(_dg_up(region.astype(np.float32)) > 0.02, iterations=3) * 255).astype(np.uint8)
+                moved = []
+                for rot, frame, out in built:
+                    rgb8 = np.clip(out[..., :3] + 0.5, 0, 255).astype(np.uint8)
+                    bgf = cv2.inpaint(np.ascontiguousarray(rgb8), hole, 8, cv2.INPAINT_TELEA).astype(np.float32)
+                    src = ndimage.shift(out[..., :3], (sh[1], sh[0], 0), order=0, mode="nearest")
+                    al = ndimage.shift(soft, (sh[1], sh[0]), order=0, mode="constant")[..., None]
+                    o = out.copy()
+                    o[..., :3] = bgf * (1 - al) + src * al
+                    moved.append((rot, frame, o))
+                built = moved
+        for rot, frame, out in built:
+            img = Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8), "RGBA")
+            img.save(out_dir / f"r{rot}_f{frame}.png")
+            if rb.exists():
+                img.save(rb / f"r{rot}_f{frame}.png")
+        extra = (", icon shifts " + " ".join(f"f{f}{s}" for f, s in sorted(shifts.items()))) if shifts else ""
+        print(f"{name}: checker glow redrawn ({DITHER_MODEL}){extra}" + ("; run hd-round-buttons" if rb.exists() else ""))
+
+
+# Buttons cut out of a panel that paints the same button (vanilla art =
+# the panel's pixels + the state's face): only the face stays opaque (AA
+# circle just past the rim's dark groove), so the panel's own ring shows in
+# every state - no second, thicker ring and no leftover crescents. Hosts
+# (checked in the engine / by matching the vanilla pixels): Skills_Window
+# (skill +/-), OptionMultiChoice/OptionSlider (slider arrows), MpWt_Rot
+# (map-note rot window), MultiMove_Base, Mess_Rot, MP_KickBanRotWindow,
+# Char_Maint, CreateCharacterBase, Barter_Follower. Run after
+# hd-round-buttons (which rewrites these from work/_round_originals/).
+BUTTON_FACE_ONLY = (
+    "SkilAddBut SkilMinusBut SldrButt_L_Arrow SldrButt_R_Arrow Cler_Big cncl_big done_big "
+    "MMB_Chest MMB_Note MMB_Skull Sm_RightArrow MultiPlay_UP MultiPlay_DWN M_UpBut M_DnBut "
+    "MP_BAN MP_KICK Char_Minus Char_Plus Char_HTFTMinus Char_HTFTPlus Big_Grn_L Big_Grn_R "
+    "BGRN_BUT LilGrnBut tiny_butt"
+).split()
+BUTTON_FACE_EDGE = 1.5
+
+
+def cmd_hd_button_face(only: str | None = None) -> None:
+    for name in BUTTON_FACE_ONLY:
+        if only is not None and only.lower() != name.lower():
+            continue
+        out_dir = hd_out_dir(f"art/interface/{name}.ART")
+        files = sorted(out_dir.glob("r*_f*.png"))
+        ref = config.WORK_DIR / "_dither_originals" / name / files[0].name
+        a0 = np.asarray(Image.open(ref if ref.exists() else files[0]).convert("RGBA"), dtype=np.float32)
+        cx, cy, g0 = FACE_CIRCLE.get(name) or _dg_face(a0)
+        h, w = a0.shape[:2]
+        yy, xx = np.mgrid[:h, :w] + 0.5
+        circle = np.clip(g0 + BUTTON_FACE_EDGE + 0.5 - np.hypot(xx - cx, yy - cy), 0, 1)
+        for f in files:
+            a = np.asarray(Image.open(f).convert("RGBA"), dtype=np.float32)
+            a[..., 3] = np.minimum(a[..., 3], circle * 255)
+            Image.fromarray((a + 0.5).astype(np.uint8), "RGBA").save(f)
+        print(f"{name}: face only (centre {cx:.1f},{cy:.1f}, r {g0 + BUTTON_FACE_EDGE:.1f})")
+
+
 def cmd_hd_scroll_thumb(model: str | None = None) -> None:
     rels = [next(r for r in find_category_files("interface") if r.lower() == p.lower()) for p in SCROLL_THUMB_PIECES]
     (top, top_key), (mid, mid_key), (bot, bot_key) = (_frame_rgb_key(r) for r in rels)
@@ -2095,7 +2976,7 @@ def cmd_hd_scroll_thumb(model: str | None = None) -> None:
     stage = config.WORK_DIR / "_scroll_thumb"
     stage.mkdir(parents=True, exist_ok=True)
     Image.fromarray(src, "RGB").save(stage / "in.png")
-    run_esrgan(stage / "in.png", stage / "out.png", model or config.REALESRGAN_MODEL)
+    run_esrgan(stage / "in.png", stage / "out.png", model or SCROLL_THUMB_MODEL)
     hd = np.asarray(load_and_validate(stage / "out.png", (src.shape[1] * HD_SCALE, src.shape[0] * HD_SCALE), "hd-scroll-thumb"))
     mask_rgb = Image.fromarray(np.where(key, 0, 255).astype(np.uint8), "L").convert("RGB")
     alpha = np.asarray(hqx.hq4x(mask_rgb).convert("L"), dtype=np.float32) / 255.0
@@ -3318,104 +4199,47 @@ def cmd_hd_scroll_chains() -> None:
         print(f"{name}: chain erased HD rows {ey0}..{ey1}, repainted centre {x_c} (1x), x {cx}.., y {y0}..{y1}")
 
 
-# Round 8 pass 12 feedback (#48): the worldmap's bottom plate (MapMain, with
-# Nav_Cvr over its top half at 1x 294,341) has two pill frames whose dark
-# inner groove sits ~16 HD px from the outer edge at the top but ~8 at the
-# bottom. Everything inside each pill but its outer 5 HD px is moved up
-# NAV_PILL_SHIFT px, so both rims are ~12. Pills are stadiums (HD x0, y0,
-# x1, y1). Idempotent: works from backups of both sidecars.
-NAV_PILLS = [(1184, 1444, 1458, 1566), (1716, 1444, 1990, 1566)]
-NAV_PILL_SHIFT = 4
+# Round 8 pass 12 feedback (#48), redone 2026-10-01: the worldmap's bottom
+# plate (MapMain, with Nav_Cvr over its top half at 1x 294,341) has two pill
+# frames whose dark inner groove sits ~16 HD px in from the outer edge at the
+# top, ~7 at the bottom, 11-14 at the caps. (The first fix moved each pill's
+# inside up 4 px under a hard stadium mask: steps at the mask edge, "shifted".)
+# Now each pill is re-mapped along its own normals: per ray from the outer
+# outline, the groove depth is measured (darkest point 3..28 px in), smoothed
+# round the perimeter, and depths 0..NAV_PILL_DEPTH are stretched piecewise
+# so the groove lands at the median depth everywhere - the gold keeps its own
+# shading and texture. Also softens the tone step where the two upscales meet
+# (Nav_Cvr's last row, HD y 1503/1504). Pills: outer outline as stadiums
+# (straight part x0, x1, centre y, radius; HD, fitted). Idempotent: works from
+# backups of both sidecars.
+NAV_PILLS = [(1254.5, 1394.5, 1504.0, 60.5), (1778.5, 1919.5, 1504.0, 60.5)]
+NAV_PILL_DEPTH = 45
+NAV_EDGE_LIGHT = (1338, 1506, 1440)  # #199: plate top edge lit (HD x0, x1; rows above y)
+NAV_EDGE_GAIN = 0.45
+NAV_EDGE_COLOUR = (235, 200, 135)    # brass light
+NAV_PIN = (1976, 1998, 1496, 1510)   # right pill's pin to the frame line (HD x0, x1, y0, y1)
 NAV_CVR_POS = (294, 341)  # 1x, wmap_ui.c wmap_ui_nav_cvr_frame (382 - window y 41)
 
 
-# Pass 13 #62: character creation's arrow buttons (portrait Big_Grn_L/R,
-# gender/race/background MPCycleLeft/RightButton). The upscales kept the
-# vanilla's dithered checker in the lit arrows, two different reds, and the
-# big ones' clipped crescent of rim on one side. Rebuilt: one disc (frame
-# 0's, arrow inpainted) for every frame so nothing shifts on hover, vector
-# arrows (1x polygons traced from the vanilla) in shared colours, and the
-# big discs cut round and centred on CreateCharacterBase's sockets.
-# name -> (arrow polygon (1x px edges), disc mask (cx, cy, r) 1x or None,
-#          content shift (dx, dy) 1x)
-CYCLE_ARROWS = {
-    "Big_Grn_L": ([(8.0, 15.5), (14.8, 8.7), (14.8, 12.0), (22.0, 12.0), (22.0, 19.0),
-                   (14.8, 19.0), (14.8, 22.3)], (15.0, 14.8, 15.6), (0.0, -0.7)),
-    "Big_Grn_R": ([(23.0, 15.5), (16.2, 8.7), (16.2, 12.0), (9.0, 12.0), (9.0, 19.0),
-                   (16.2, 19.0), (16.2, 22.3)], (16.0, 14.8, 15.6), (1.0, -0.7)),
-    # own partial gold ring clashed with the pill's socket ring: cut inside it
-    "MPCycleLeftButton": ([(8.0, 11.5), (14.0, 5.8), (14.0, 17.2)], (11.05, 11.3, 10.4), (-0.45, -0.2)),
-    "MPCycleRightButton": ([(16.0, 11.5), (10.0, 5.8), (10.0, 17.2)], (11.85, 11.1, 10.4), (0.35, -0.4)),
-}
-# frame -> (top colour, bottom colour) of the arrow's vertical gradient
-CYCLE_ARROW_COLORS = {
-    0: ((170, 18, 36), (112, 4, 22)),    # idle
-    1: ((222, 52, 50), (160, 22, 28)),   # pressed
-    2: ((250, 84, 74), (196, 34, 36)),   # hover
-}
-
-
-def cmd_hd_cycle_arrows(only: str | None = None) -> None:
-    import cv2
-    from PIL import ImageDraw
-    from scipy import ndimage
-
-    s = HD_SCALE
-    ss = 4  # supersampling for the polygon
-    for name, (poly, disc, (dx, dy)) in CYCLE_ARROWS.items():
-        if only is not None and only.lower() not in name.lower():
-            continue
-        out_dir = hd_out_dir(f"art/interface/{name}.ART")
-        backup = config.WORK_DIR / "_cycle_arrow_originals" / name
-        if not backup.exists():
-            shutil.copytree(out_dir, backup)
-        base = np.asarray(Image.open(backup / "r0_f0.png").convert("RGBA")).astype(np.float32)
-        h, w = base.shape[:2]
-
-        # the old arrow (red-dominant pixels, grown) inpainted out of the disc
-        rgb = base[..., :3]
-        red = (rgb[..., 0] > rgb[..., 1] + 35) & (rgb[..., 0] > 60) & (base[..., 3] > 128)
-        red = ndimage.binary_dilation(red, iterations=5)
-        clean = cv2.inpaint(np.ascontiguousarray(rgb.clip(0, 255).astype(np.uint8)),
-                            red.astype(np.uint8) * 255, 8, cv2.INPAINT_TELEA).astype(np.float32)
-        disc_im = np.dstack([clean, base[..., 3]])
-
-        if dx or dy:
-            m = np.float32([[1, 0, dx * s], [0, 1, dy * s]])
-            disc_im = cv2.warpAffine(disc_im, m, (w, h), flags=cv2.INTER_LINEAR,
-                                     borderMode=cv2.BORDER_REPLICATE)
-        if disc is not None:
-            cx, cy, r = disc
-            yy, xx = np.mgrid[0:h, 0:w] + 0.5
-            d = np.hypot(xx - cx * s, yy - cy * s)
-            disc_im[..., 3] = np.minimum(disc_im[..., 3], np.clip(r * s - d + 0.5, 0, 1) * 255)
-
-        # arrow coverage, supersampled
-        big = Image.new("L", (w * ss, h * ss), 0)
-        ImageDraw.Draw(big).polygon([((x + dx) * s * ss, (y + dy) * s * ss) for x, y in poly], fill=255)
-        cov = np.asarray(big.resize((w, h), Image.LANCZOS)).astype(np.float32) / 255.0
-        ys = [(y + dy) * s for _, y in poly]
-        t = np.clip((np.arange(h)[:, None] - min(ys)) / max(1.0, max(ys) - min(ys)), 0, 1)
-        # bevel: lit along the top-left edge, shaded along the bottom-right
-        inner = ndimage.gaussian_filter(cov, 2.0)
-        gy, gx = np.gradient(inner)
-        bevel = np.clip(-(gx + gy) * 6.0, -1, 1) * cov
-        # the arrow sits in a recess: a soft dark halo under it
-        shadow = ndimage.gaussian_filter(ndimage.shift(cov, (1.5, 1.5), order=1), 2.0) * 0.55
-
-        for f, (top, bot) in CYCLE_ARROW_COLORS.items():
-            top_c, bot_c = np.array(top, np.float32), np.array(bot, np.float32)
-            col = top_c[None, None] * (1 - t[..., None]) + bot_c[None, None] * t[..., None]
-            col = col + np.where(bevel[..., None] > 0, (255 - col) * bevel[..., None] * 0.45,
-                                 col * bevel[..., None] * 0.5)
-            out = disc_im.copy()
-            out[..., :3] *= (1 - shadow[..., None])
-            out[..., :3] = out[..., :3] * (1 - cov[..., None]) + col * cov[..., None]
-            Image.fromarray(out.clip(0, 255).astype(np.uint8), "RGBA").save(out_dir / f"r0_f{f}.png")
-        print(f"{name}: disc + vector arrow, {len(CYCLE_ARROW_COLORS)} frames")
+def _stadium_rays(sx0, sx1, cy, r, step=1.0):
+    """Outer-outline samples round a stadium, clockwise from the top-left: x, y, outward normal."""
+    l = sx1 - sx0
+    per = 2 * l + 2 * np.pi * r
+    s = np.arange(0, per, step)
+    X, Y, NX, NY = (np.zeros_like(s) for _ in range(4))
+    top, rc, bot = s < l, (s >= l) & (s < l + np.pi * r), (s >= l + np.pi * r) & (s < 2 * l + np.pi * r)
+    lc = s >= 2 * l + np.pi * r
+    X[top], Y[top], NY[top] = sx0 + s[top], cy - r, -1
+    an = (s[rc] - l) / r - np.pi / 2
+    X[rc], Y[rc], NX[rc], NY[rc] = sx1 + r * np.cos(an), cy + r * np.sin(an), np.cos(an), np.sin(an)
+    X[bot], Y[bot], NY[bot] = sx1 - (s[bot] - l - np.pi * r), cy + r, 1
+    an = (s[lc] - 2 * l - np.pi * r) / r + np.pi / 2
+    X[lc], Y[lc], NX[lc], NY[lc] = sx0 + r * np.cos(an), cy + r * np.sin(an), np.cos(an), np.sin(an)
+    return per, X, Y, NX, NY
 
 
 def cmd_hd_nav_pill_rim() -> None:
+    from scipy import ndimage
     dirs = {}
     for name in ("MapMain", "Nav_Cvr"):
         out_dir = hd_out_dir(f"art/interface/{name}.ART")
@@ -3428,26 +4252,84 @@ def cmd_hd_nav_pill_rim() -> None:
     nx, ny = NAV_CVR_POS[0] * HD_SCALE, NAV_CVR_POS[1] * HD_SCALE
     comp = bg.copy()
     comp.alpha_composite(nav, (nx, ny))
-    a = np.asarray(comp).copy()
-    h, w = a.shape[:2]
-    yy, xx = np.mgrid[0:h, 0:w]
-    moved = np.roll(a, -NAV_PILL_SHIFT, axis=0)
-    mask = np.zeros((h, w), bool)
-    for x0, y0, x1, y1 in NAV_PILLS:
-        x0, y0, x1, y1 = x0 + 5, y0 + 5, x1 - 5, y1 - 5
-        r = (y1 - y0) / 2
-        dx = np.maximum(np.maximum(x0 + r - xx, xx - (x1 - r)), 0)
-        mask |= dx ** 2 + (yy - (y0 + y1) / 2) ** 2 <= r * r
-    a[mask] = moved[mask]
+    a = np.asarray(comp).astype(np.float32)
+    seam = ny + nav.height                      # first MapMain-only row
+    lo = ndimage.gaussian_filter1d(a, 2.0, axis=0)
+    w = np.clip(1 - np.abs(np.arange(a.shape[0]) + 0.5 - seam) / 4, 0, 1)[:, None, None]
+    a[:, nx:nx + nav.width] = (a * (1 - w) + lo * w)[:, nx:nx + nav.width]
+    lum = ndimage.gaussian_filter(a[..., :3].mean(-1), 1.0)
+    out = a.copy()
+    h, wd = a.shape[:2]
+    D = NAV_PILL_DEPTH
+    for sx0, sx1, cy, r in NAV_PILLS:
+        per, X, Y, NX, NY = _stadium_rays(sx0, sx1, cy, r)
+        u = np.arange(3, 28.01, 0.25)
+        prof = ndimage.map_coordinates(lum, [Y[:, None] - NY[:, None] * u, X[:, None] - NX[:, None] * u], order=1)
+        g = u[np.argmin(prof, axis=1)]
+        g = ndimage.gaussian_filter1d(g, 12, mode="wrap")
+        g0 = float(np.median(g))
+        bx0, bx1 = int(sx0 - r - 2), int(sx1 + r + 3)
+        by0, by1 = int(cy - r - 2), int(cy + r + 3)
+        yy, xx = np.mgrid[by0:by1, bx0:bx1].astype(np.float32) + 0.0
+        cx = np.clip(xx, sx0, sx1)
+        vx, vy = xx - cx, yy - cy
+        dist = np.hypot(vx, vy) + 1e-6
+        depth = r - dist
+        nxp, nyp = vx / dist, vy / dist
+        l = sx1 - sx0
+        ang = np.arctan2(vy, vx)
+        sp = np.where(vx == 0, np.where(vy < 0, cx - sx0, l + np.pi * r + (sx1 - cx)),
+                      np.where(xx > sx1, l + r * (ang + np.pi / 2),
+                               2 * l + np.pi * r + r * (np.mod(ang, 2 * np.pi) - np.pi / 2)))
+        gi = np.interp(sp, np.arange(len(g)) * (per / len(g)), g, period=per)
+        dsrc = np.where(depth <= g0, depth * gi / g0, gi + (depth - g0) * (D - gi) / (D - g0))
+        on = (depth > -0.5) & (depth < D)
+        dsrc = np.where(on, dsrc, depth)
+        sxs, sys_ = cx + nxp * (r - dsrc), cy + nyp * (r - dsrc)
+        for c in range(4):
+            out[by0:by1, bx0:bx1, c] = np.where(on, ndimage.map_coordinates(a[..., c], [sys_, sxs], order=3),
+                                                out[by0:by1, bx0:bx1, c])
+        print(f"pill x {sx0 - r:.0f}..{sx1 + r:.0f}: groove {g.min():.1f}..{g.max():.1f} -> {g0:.1f} HD px in")
+    # right pill's pin to the frame line: straddles the seam and Nav_Cvr's diagonal outline, came
+    # out a ragged blob with a dark gap - redrawn as a rod with its own cleanest column's profile
+    px0, px1, py0, py1 = NAV_PIN
+    col = np.median(out[py0:py1, px0 - 4:px0 + 3], axis=1)
+    sx0, sx1, cy, r = NAV_PILLS[1]
+    yy, xx = np.mgrid[py0 - 2:py1 + 2, px0:px1 + 2].astype(np.float32)
+    rr = (py1 - py0) / 2
+    cap = np.clip(rr + 0.5 - np.hypot(np.maximum(xx - (px1 - rr), 0), yy + 0.5 - (py0 + py1) / 2), 0, 1)
+    pin = cap * (np.hypot(np.clip(xx, sx0, sx1) - xx, yy - cy) > r - 1)
+    rod = np.zeros(yy.shape + (4,), np.float32)
+    rod[2:-2] = col[:, None, :]
+    rod[:2], rod[-2:] = col[:1], col[-1:]
+    sub = out[py0 - 2:py1 + 2, px0:px1 + 2]
+    sub[..., :3] = sub[..., :3] * (1 - pin[..., None]) + rod[..., :3] * pin[..., None]
+    # #199: a little more light on the plate's top edge left of the globe (shoulder + flat run)
+    ex0, ex1, ey1 = NAV_EDGE_LIGHT
+    plate = np.zeros(out.shape[:2], bool)
+    plate[ny:ny + nav.height, nx:nx + nav.width] = np.asarray(nav)[..., 3] > 128
+    d = ndimage.distance_transform_edt(plate)
+    xr = np.arange(out.shape[1], dtype=np.float32)
+    ramp = np.clip(np.minimum(xr - ex0, ex1 - xr) / 14, 0, 1)[None, :]
+    k = NAV_EDGE_GAIN * np.exp(-np.maximum(d - 1, 0) / 2.0) * plate * ramp
+    k[ey1:] = 0
+    k = ndimage.gaussian_filter(k, 0.6)[..., None]
+    light = np.array(NAV_EDGE_COLOUR, np.float32)
+    out[..., :3] = out[..., :3] + (255 - out[..., :3]) * k * (light / 255)
+    out = np.clip(out + 0.5, 0, 255).astype(np.uint8)
     out_bg = np.asarray(bg).copy()
-    out_bg[mask] = a[mask]
+    out_bg[seam:] = out[seam:]                  # above the seam Nav_Cvr carries the result
+    nav_a = np.asarray(nav).copy()
+    nsub = out[ny:ny + nav.height, nx:nx + nav.width]
+    pin_full = np.zeros(out.shape[:2], bool)
+    pin_full[py0 - 2:py1 + 2, px0:px1 + 2] = pin > 0.01
+    pin_nav = pin_full[ny:ny + nav.height, nx:nx + nav.width]
+    nav_a[..., 3][pin_nav] = np.maximum(nav_a[..., 3][pin_nav], 255)
+    vis = nav_a[..., 3] >= 250
+    nav_a[..., :3][vis] = nsub[..., :3][vis]
     Image.fromarray(out_bg, "RGBA").save(dirs["MapMain"][0] / "r0_f0.png")
-    n = np.asarray(nav).copy()
-    nh, nw = n.shape[:2]
-    sub_mask = mask[ny:ny + nh, nx:nx + nw] & (n[..., 3] > 0)
-    n[..., :3][sub_mask] = a[ny:ny + nh, nx:nx + nw, :3][sub_mask]
-    Image.fromarray(n, "RGBA").save(dirs["Nav_Cvr"][0] / "r0_f0.png")
-    print(f"MapMain/Nav_Cvr: {int(mask.sum())} pill px moved up {NAV_PILL_SHIFT}")
+    Image.fromarray(nav_a, "RGBA").save(dirs["Nav_Cvr"][0] / "r0_f0.png")
+    print("MapMain/Nav_Cvr: pill rims evened")
 
 
 # Round 8 pass 12 feedback (#59): the charedit Skills_Window's four gauges.
@@ -3577,10 +4459,9 @@ def cmd_hd_skill_gauge() -> None:
 # MPChatBackground's carved knot stood upright, its gold line on the game edge,
 # ending 15 screen px above the bottom. Built in right-bar orientation (x=0 at
 # the game edge); the left bar is its mirror but built on its own (the edge
-# light isn't mirrored), both saved in screen orientation. Plus the cap: the
-# top HUD's metal mirrored over its brown end strip (IntTop's last 3 px), baked
-# into IntTop's sidecar (original kept in work/_sidebar_originals/; a 4:3
-# window shows that metal end too).
+# light isn't mirrored), both saved in screen orientation. IntTop's own dark
+# end strip stays (a cap of mirrored metal over it was tried and reverted -
+# the user prefers the vanilla end).
 SIDE_BARS_DIR = "art/interface/_SideBars"
 SIDE_BAR_WIDTHS = [213, 356, 533, 830, 1778]  # HD px at 1600 tall: 16:10, 16:9, 2:1, 21:9, 32:9
 SIDE_BAR_H = 1600
@@ -3598,8 +4479,10 @@ SIDE_BAR_KNOT_KX = 1.49         # the carving's sideways scale at 356 (wider bar
 SIDE_BAR_KNOT_CONTRAST = 0.62   # share of the carving's own contrast kept (colour/brightness -> the wood)
 SIDE_BAR_KNOT_SHARP = 0.15      # sharpen across the knot (its sideways stretch softens it)
 SIDE_BAR_KNOT_HIGH = 0.33       # copper highlights toned down by this
+SIDE_BAR_FRAME_ROWS = (900, 1340)   # CreateCharacterBase's big box: straight edge rows (HD; clear of the corner ornaments)
+SIDE_BAR_FRAME_R = (3071, 3097)     # its right edge, inside (black) -> gold -> shadow on the wood
+SIDE_BAR_FRAME_L = (1256, 1280)     # its left edge, gold -> inside (no light rim: the bar wood is darker)
 SIDE_BAR_RIVETS = [(55, 30), (55, 215)]            # down the inner plate's game side; + 3 round its arc
-SIDE_BAR_CAP = (3176, 3188, 3200)                  # IntTop cols: source, and the brown strip they cover
 
 
 def _sb_load(name: str) -> np.ndarray:
@@ -3756,6 +4639,16 @@ def _sb_build(side: str, w: int, src: dict) -> np.ndarray:
     ratio = ((lum - ex * SIDE_BAR_KNOT_HIGH) / np.maximum(lum, 0.01))[..., None]
     less_pink = np.clip(ex / 0.15, 0, 1)[..., None] * 0.3
     pv[:, c0:] = np.clip(k * ratio * (1 - less_pink) + k.mean(-1, keepdims=True) * ratio * less_pink, 0, 1)
+    # the game-edge line: the panels' gold box frame (as on the char creation panel) instead of
+    # MPChatBackground's thin copper line - its straight edge strip at screen scale, mirror-tiled
+    # down; it runs into the drop shadow the frame casts on the wood
+    fr = src["frame_" + side]
+    while fr.shape[0] < pv.shape[0]:
+        fr = np.concatenate([fr, fr[::-1]], 0)
+    fw = fr.shape[1]
+    pv[:, :fw] = fr[:pv.shape[0]]
+    sh = np.linspace(0.6, 1.0, 8)
+    pv[:, fw:fw + 8] *= sh[None, :, None]
     img[SIDE_BAR_KNOT_Y:] = pv
 
     # base plate (quarter-circle cut at the game edge) and the raised inner plate on it
@@ -3782,6 +4675,23 @@ def _sb_build(side: str, w: int, src: dict) -> np.ndarray:
     img *= (1 - 0.18 * xn[None, :] ** 2 * vm)[..., None]
     img = np.clip(img, 0, 1)
     return img if side == "R" else img[:, ::-1]
+
+
+# Wood re-toned halfway between the bottom HUD's wood (56/43/33, what the
+# bars were matched to) and the full-screen panels' (~64/47/35) - user's
+# pick from comparison/side_bars_tone/ ("mid"); warm pixels only, the
+# grey metal stays.
+SIDE_BAR_WOOD_FROM = (56.0, 43.0, 33.0)
+SIDE_BAR_WOOD_TO = (60.5, 45.0, 34.3)
+
+
+def _sb_retone(a: np.ndarray) -> np.ndarray:
+    from scipy import ndimage
+    mx, mn = a.max(2), a.min(2)
+    sat = (mx - mn) / np.maximum(mx, 1e-3)
+    m = ndimage.gaussian_filter(np.clip((sat - 0.10) / 0.15, 0, 1), 6)[..., None]
+    g = np.array(SIDE_BAR_WOOD_TO) / np.array(SIDE_BAR_WOOD_FROM)
+    return np.clip(a * (1 - m) + a * g * m, 0, 1)
 
 
 def cmd_hd_side_bars() -> None:
@@ -3812,6 +4722,15 @@ def cmd_hd_side_bars() -> None:
         "wood": _sb_wood_tone(_sb_load("IntBotom")),
         "rivet": rivet,
     }
+    # gold frame strips (game side first): the big box's straight edges on CreateCharacterBase -
+    # its right edge for the right bar, its left edge (mirrored into build orientation) for the left
+    ccb = _sb_load("CreateCharacterBase")[..., :3]
+    fh = int(round((SIDE_BAR_FRAME_ROWS[1] - SIDE_BAR_FRAME_ROWS[0]) * s))
+    for side, (x0, x1) in (("R", SIDE_BAR_FRAME_R), ("L", SIDE_BAR_FRAME_L)):
+        strip = ccb[SIDE_BAR_FRAME_ROWS[0]:SIDE_BAR_FRAME_ROWS[1], x0:x1]
+        if side == "L":
+            strip = strip[:, ::-1]
+        src["frame_" + side] = _sb_resize(strip, int(round((x1 - x0) * s)), fh)
 
     out = config.HD_OVERLAY_DIR / SIDE_BARS_DIR
     if out.exists():
@@ -3821,20 +4740,11 @@ def cmd_hd_side_bars() -> None:
              "# bar <width> <height>"]
     for bw in SIDE_BAR_WIDTHS:
         for side, name in (("L", "left"), ("R", "right")):
-            a = _sb_build(side, bw, src)
+            a = _sb_retone(_sb_build(side, bw, src))
             Image.fromarray((a * 255 + 0.5).astype(np.uint8), "RGB").save(out / f"{name}_{bw}.png")
         lines.append(f"bar {bw} {SIDE_BAR_H}")
         print(f"side bars {bw}: done")
 
-    # the cap: baked into the HUD's sidecar, so it shows exactly when the HUD does
-    top_dir = hd_out_dir("art/interface/IntTop.ART")
-    backup = config.WORK_DIR / "_sidebar_originals" / "IntTop"
-    if not backup.exists():
-        shutil.copytree(top_dir, backup)
-    a = np.asarray(Image.open(backup / "r0_f0.png").convert("RGBA")).copy()
-    c0, c1, c2 = SIDE_BAR_CAP
-    a[:, c1:c2] = a[:, c1 - (c2 - c1):c1][:, ::-1]
-    Image.fromarray(a, "RGBA").save(top_dir / "r0_f0.png")
     (out / "layout.txt").write_text("\n".join(lines) + "\n")
     print(f"side bars -> {out}")
 
@@ -4081,6 +4991,47 @@ def cmd_hd_icon_patch(only: str | None = None) -> None:
         print(f"{name}: {len(rects)} icon(s) from {model}")
 
 
+# Worldmap coordinate boxes (#173): vanilla MapMain has an old paste seam
+# round the lower box - a flatter, smoother rectangle of wood left of and
+# under it, ending in a dark rule (1x y 214-215, x 669-791) - which the
+# upscale made obvious. Filled in HD with the sidecar's own wood 110 rows
+# further down (same columns, so the grain stays native-sharp; a 1x clone +
+# re-upscale read flat and lighter, "still stands out"), soft-blended at the
+# edges. Writes only that area, computed from a one-off backup in
+# work/_mapmain_originals/, into the live sidecar and hd-nav-pill-rim's
+# backup - either step can run first.
+MAPMAIN_PATCH = dict(rects=[(2640, 790, 2722, 876), (2640, 838, 3172, 876)], shift=110, feather=5.0)
+
+
+def cmd_hd_mapmain_patch() -> None:
+    from scipy import ndimage
+    out_dir = hd_out_dir("art/interface/MapMain.ART")
+    backup = config.WORK_DIR / "_mapmain_originals"
+    if not backup.exists():
+        shutil.copytree(out_dir, backup)
+    targets = [(backup / "r0_f0.png", out_dir / "r0_f0.png")]
+    pill = config.WORK_DIR / "_nav_pill_originals" / "MapMain" / "r0_f0.png"
+    if pill.exists():
+        pill_orig = backup / "nav_pill_r0_f0.png"
+        if not pill_orig.exists():
+            shutil.copy2(pill, pill_orig)
+        targets.append((pill_orig, pill))
+    for base_png, dest in targets:
+        base = np.asarray(Image.open(base_png).convert("RGBA"), dtype=np.float32)
+        live = np.asarray(Image.open(dest).convert("RGBA"), dtype=np.float32)
+        m = np.zeros(base.shape[:2], bool)
+        for x0, y0, x1, y1 in MAPMAIN_PATCH["rects"]:
+            m[y0:y1, x0:x1] = True
+        f = (ndimage.gaussian_filter(m.astype(np.float32), MAPMAIN_PATCH["feather"])
+             * ndimage.binary_dilation(m, iterations=8))[..., None]
+        donor = np.roll(base, -MAPMAIN_PATCH["shift"], axis=0)
+        out = live.copy()   # only this area changes: other steps' work on the sidecar stays
+        area = ndimage.binary_dilation(m, iterations=24)
+        out[area, :3] = (base[..., :3] * (1 - f) + donor[..., :3] * f)[area]
+        Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8), "RGBA").save(dest)
+    print(f"MapMain: coordinate-box seam repainted ({len(targets)} file(s))")
+
+
 # Inventory paperdoll slot silhouettes (inven_ui.c item_ui_item_silhouette_nums,
 # blitted at inven_ui_inventory_paperdoll_inv_slot_rects over PDoll): opaque
 # rects carrying their own copy of the slot grid, a few levels off PDoll's.
@@ -4322,6 +5273,86 @@ def cmd_hd_lens_corners(only: str | None = None) -> None:
             ring[..., 3] = np.maximum(ring[..., 3], m * 255)
             Image.fromarray(np.clip(ring + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / src.name)
             print(f"{name}/{src.name}: corners from {panel} ({int((m > 0.5).sum())} HD px)")
+
+
+# One gold ring for every PC lens (2026-10-01): each lens screen had its own
+# upscale of the same vanilla ring, some wobbly (angular roughness 2.0-3.8 vs
+# 1.6 for the inventory's in-context one, hd-lens-context). The ring band
+# (1x r 44.5..LENS_UNIFY_R_OUT round the 89x89 box centre) is taken from the
+# inventory composite (PDoll + Lns_Papr), smoothed a little along the circle,
+# and painted into every other lens art (the corners - alpha kept) and its
+# panels (the ring's sides, outside the box - opaque pixels only), feathered
+# into their own pixels past the ring. Run last of the lens steps; rebuilt
+# from work/_lens_unify_originals/ every run. Lens art -> [(panel, x, y)].
+LENS_UNIFY_SRC = ("PDoll", "Lns_Papr", 11, 9)
+LENS_UNIFY = {
+    "Char_PCC": [("Char_Maint", 12, 10)],
+    "PCWinCvr": [("LogBooks_Side", 25, 24)],
+    "Lns_Map": [("MapMain", 25, 24)],
+    "Lns_Schm": [("Schematic_Base", 50, 26)],
+    "Lns_Bart": [("Barter", 16, 17), ("Barter_Follower", 16, 17)],
+    "Lns_Loot": [("Loot", 16, 17)],
+    "SaveLoadPCLens": [("SaveLoadBackground", 84, 10)],
+    "OptionsPCLens": [("OptionsMenuBack", 84, 67)],
+}
+LENS_UNIFY_R_OUT = 51.0      # 1x: past the gold's outer edge (49.5) and its dark rim
+LENS_UNIFY_FEATHER = 6.0     # HD px
+LENS_UNIFY_ARC_SIGMA = 3.0   # HD px along the circle
+
+
+def _lens_unify_load(name: str) -> tuple[Path, np.ndarray]:
+    out_dir = hd_out_dir(f"art/interface/{name}.ART")
+    backup = config.WORK_DIR / "_lens_unify_originals" / name
+    if not backup.exists():
+        shutil.copytree(out_dir, backup)
+    return out_dir, np.asarray(Image.open(backup / "r0_f0.png").convert("RGBA"), dtype=np.float32)
+
+
+def cmd_hd_lens_unify() -> None:
+    from scipy import ndimage
+    S = HD_SCALE
+    n = 89 * S
+    m = int(np.ceil(LENS_UNIFY_R_OUT * S - n / 2)) + 12
+    panel, lens, lx, ly = LENS_UNIFY_SRC
+    _, pan = _lens_unify_load(panel)
+    _, ring = _lens_unify_load(lens)
+    pan = np.pad(pan, ((m, m), (m, m), (0, 0)), mode="edge")
+    src = pan[ly * S:ly * S + n + 2 * m, lx * S:lx * S + n + 2 * m].copy()
+    box = src[m:m + n, m:m + n]
+    op = ring[..., 3:4] / 255
+    box[..., :3] = box[..., :3] * (1 - op) + ring[..., :3] * op
+    N = n + 2 * m
+    c = N / 2
+    yy, xx = np.mgrid[:N, :N].astype(np.float32) + 0.5
+    r = np.hypot(xx - c, yy - c)
+    th = np.arctan2(yy - c, xx - c)
+    acc, ws = np.zeros_like(src[..., :3]), 0.0
+    for k in np.arange(-3 * LENS_UNIFY_ARC_SIGMA, 3 * LENS_UNIFY_ARC_SIGMA + 0.1, 1.0):
+        w = np.exp(-0.5 * (k / LENS_UNIFY_ARC_SIGMA) ** 2)
+        a2 = th + k / np.maximum(r, 1)
+        X, Y = c + r * np.cos(a2) - 0.5, c + r * np.sin(a2) - 0.5
+        acc += w * np.stack([ndimage.map_coordinates(src[..., ch], [Y, X], order=1, mode="nearest") for ch in range(3)], -1)
+        ws += w
+    smooth = acc / ws
+    r_in, r_out = 44.5 * S - 4, LENS_UNIFY_R_OUT * S
+    band = np.clip((r - r_in) / 2, 0, 1) * np.clip((r_out - r) / LENS_UNIFY_FEATHER, 0, 1)
+    for lname, panels in LENS_UNIFY.items():
+        out_dir, la = _lens_unify_load(lname)
+        f = band[m:m + n, m:m + n, None]
+        la[..., :3] = la[..., :3] * (1 - f) + smooth[m:m + n, m:m + n] * f
+        Image.fromarray(np.clip(la + 0.5, 0, 255).astype(np.uint8), "RGBA").save(out_dir / "r0_f0.png")
+        for pname, px, py in panels:
+            pdir, pa = _lens_unify_load(pname)
+            ph, pw = pa.shape[:2]
+            pa = np.pad(pa, ((m, m), (m, m), (0, 0)))    # padding is transparent: never painted
+            sub = pa[py * S:py * S + N, px * S:px * S + N]
+            f = band.copy()
+            f[m:m + n, m:m + n] = 0                       # inside the box: the lens art's
+            f = (f * (sub[..., 3] > 250))[..., None]
+            sub[..., :3] = sub[..., :3] * (1 - f) + smooth * f
+            pa = pa[m:m + ph, m:m + pw]
+            Image.fromarray(np.clip(pa + 0.5, 0, 255).astype(np.uint8), "RGBA").save(pdir / "r0_f0.png")
+        print(f"{lname}: ring from {lens} ({', '.join(p for p, _, _ in panels)})")
 
 
 def cmd_hd_lens_rings(only: str | None = None, out_root: Path | None = None) -> None:
@@ -4898,10 +5929,13 @@ def main() -> None:
     p_schem.add_argument("--only", default=None)
     p_icon = sub.add_parser("hd-icon-patch", help="Re-upscale icons painted into panels with another model (ICON_PATCHES)")
     p_icon.add_argument("--only", default=None)
+    sub.add_parser("hd-hud-touchup", help="IntBotom: red knob glow back, panel edge jog straightened (run after hd-arc-smooth)")
+    sub.add_parser("hd-mapmain-patch", help="Repaint the worldmap coordinate boxes' vanilla paste seam (MAPMAIN_PATCH, #173)")
     p_black = sub.add_parser("hd-black-fill", help="Near-black panel boxes / icon backgrounds -> pure black (BLACK_BOXES, BLACK_BG)")
     p_black.add_argument("--only", default=None)
     p_lcorn = sub.add_parser("hd-lens-corners", help="Lens ring corners from the panel's HD wood (LENS_CORNERS); run after hd-lens-rings")
     p_lcorn.add_argument("--only", default=None)
+    sub.add_parser("hd-lens-unify", help="One clean gold ring (the inventory's) on every PC lens + its panels (LENS_UNIFY); run last")
     p_lens = sub.add_parser("hd-lens-rings", help="Smooth the PC lens ring sidecars' hole edge (LENS_RINGS)")
     p_lens.add_argument("--only", default=None)
 
@@ -4922,6 +5956,22 @@ def main() -> None:
     p_pal.add_argument("--model", default=None)
     p_pal.add_argument("--force", action="store_true")
 
+    p_round = sub.add_parser("hd-round-buttons", help="Round buttons: centred rim smoothed along the circle, clean outline (ROUND_*)")
+    p_round.add_argument("--only", default=None)
+    p_dith = sub.add_parser("hd-dither-buttons", help="Checkerboard-shaded buttons: average upscaled, hand-drawn HD checker on top (DITHER_*); run hd-round-buttons after")
+    p_dith.add_argument("--only", default=None)
+    p_face = sub.add_parser("hd-button-face", help="Panel-cut buttons: only the face opaque, the panel's ring shows (BUTTON_FACE_ONLY); run after hd-round-buttons")
+    p_face.add_argument("--only", default=None)
+    p_item = sub.add_parser("hd-item-remacri", help="Items with remacri inside, the default model's outline; the sharper one per item (ITEM_*)")
+    p_item.add_argument("--only", default=None)
+    p_item.add_argument("--force", action="store_true")
+    p_crea = sub.add_parser("hd-creature-remacri", help="Creatures with remacri + the default model's outline, all of them; default kept in work/_<cat>_default/")
+    p_crea.add_argument("categories", nargs="*", default=list(CREATURE_CATEGORIES))
+    p_crea.add_argument("--only", default=None)
+    p_crea.add_argument("--force", action="store_true")
+    p_rev = sub.add_parser("hd-remacri-revert", help="Put creature/item arts back on the default model from work/_<cat>_default/")
+    p_rev.add_argument("category")
+    p_rev.add_argument("names", nargs="+")
     sub.add_parser("hd-scroll-thumb", help="Upscale the scrollbar thumb (ScrllSlideT/M1/B) as one stack and cut it back apart (no per-row seams)")
 
     sub.add_parser("hd-background-matte", help="Replace the background baked into PC-lens-style pieces with the HD background crop (see BACKGROUND_MATTE_PIECES)")
@@ -4995,6 +6045,9 @@ def main() -> None:
     if args.command == "hd-lens-corners":
         cmd_hd_lens_corners(args.only)
         return
+    if args.command == "hd-lens-unify":
+        cmd_hd_lens_unify()
+        return
     if args.command == "hd-lens-rings":
         cmd_hd_lens_rings(args.only)
         return
@@ -5044,6 +6097,12 @@ def main() -> None:
     if args.command == "hd-icon-patch":
         cmd_hd_icon_patch(args.only)
         return
+    if args.command == "hd-hud-touchup":
+        cmd_hd_hud_touchup()
+        return
+    if args.command == "hd-mapmain-patch":
+        cmd_hd_mapmain_patch()
+        return
     if args.command == "hd-black-fill":
         cmd_hd_black_fill(args.only)
         return
@@ -5060,6 +6119,25 @@ def main() -> None:
         cmd_hd_palettes(args.categories, model=args.model, force=args.force)
         return
 
+    if args.command == "hd-round-buttons":
+        cmd_hd_round_buttons(args.only)
+        return
+    if args.command == "hd-dither-buttons":
+        cmd_hd_dither_buttons(args.only)
+        return
+    if args.command == "hd-button-face":
+        cmd_hd_button_face(args.only)
+        return
+    if args.command == "hd-creature-remacri":
+        for c in args.categories:
+            cmd_hd_remacri_edge(c, args.only, args.force)
+        return
+    if args.command == "hd-remacri-revert":
+        cmd_hd_remacri_revert(args.category, args.names)
+        return
+    if args.command == "hd-item-remacri":
+        cmd_hd_item_remacri(args.only, args.force)
+        return
     if args.command == "hd-scroll-thumb":
         cmd_hd_scroll_thumb()
         return
