@@ -2436,7 +2436,8 @@ def _rb_merge_rings(a: np.ndarray, cx: float, cy: float, inner: float, outer: fl
     return out
 
 
-def _rb_regularise(a: np.ndarray, cx: float, cy: float, r: float, use_alpha: bool, merge: bool = False) -> np.ndarray:
+def _rb_circle(a: np.ndarray, cx: float, cy: float, r: float, use_alpha: bool) -> tuple[float, float, float, float]:
+    """Rim circle of one frame: centre, dark face line radius g0, outer edge e0."""
     from scipy import ndimage
     lum = ndimage.gaussian_filter(a[..., :3].mean(-1), 1.0)
     R = np.arange(0.6 * r, r + 1, 0.5)[:, None]
@@ -2456,7 +2457,16 @@ def _rb_regularise(a: np.ndarray, cx: float, cy: float, r: float, use_alpha: boo
     else:
         e0 = r
     ok = (R[:, 0] < e0 - 3) & (R[:, 0] > 0.55 * r)
-    g0 = float(R[ok, 0][np.argmin(P[ok])])
+    return cx, cy, float(R[ok, 0][np.argmin(P[ok])]), e0
+
+
+def _rb_regularise(a: np.ndarray, cx: float, cy: float, r: float, use_alpha: bool, merge: bool = False,
+                   circle: tuple[float, float, float, float] | None = None) -> np.ndarray:
+    """circle: a state art's frame-0 _rb_circle, so every frame is smoothed
+    and cut on the same circle (fitted per frame, hover/press frames came
+    out up to 3 HD px off and the rim jumped between states)."""
+    from scipy import ndimage
+    cx, cy, g0, e0 = circle or _rb_circle(a, cx, cy, r, use_alpha)
     if merge:
         a = _rb_merge_rings(a, cx, cy, g0 + 2, e0 - 1.5)
     h, w = a.shape[:2]
@@ -2501,19 +2511,23 @@ def cmd_hd_round_buttons(only: str | None = None) -> None:
         if only is not None and only.lower() not in name.lower():
             continue
         out_dir, backup = _rb_backup(name)
+        circle = None
         for src in sorted(backup.glob("r*_f*.png")):
             a = np.asarray(Image.open(src).convert("RGBA"), dtype=np.float32)
             cx, cy, r = _rb_fit(a[..., 3])
-            out = _rb_regularise(a, cx, cy, r, True, name in ROUND_MERGE)
+            circle = circle or _rb_circle(a, cx, cy, r, True)
+            out = _rb_regularise(a, cx, cy, r, True, name in ROUND_MERGE, circle)
             Image.fromarray((out + 0.5).astype(np.uint8), "RGBA").save(out_dir / src.name)
         print(f"{name}: rims smoothed" + (" (rings merged)" if name in ROUND_MERGE else ""))
     for name, cx, cy, r in ROUND_ART_SPOTS:
         if only is not None and only.lower() not in name.lower():
             continue
         out_dir, backup = _rb_backup(name)
+        circle = None
         for src in sorted(backup.glob("r*_f*.png")):
             a = np.asarray(Image.open(src).convert("RGBA"), dtype=np.float32)
-            out = _rb_regularise(a, cx, cy, r, False)
+            circle = circle or _rb_circle(a, cx, cy, r, False)
+            out = _rb_regularise(a, cx, cy, r, False, circle=circle)
             Image.fromarray((out + 0.5).astype(np.uint8), "RGBA").save(out_dir / src.name)
         print(f"{name}: button rim smoothed")
     panels: dict[str, list] = {}
@@ -2671,6 +2685,10 @@ BUTTON_HOSTS = {
     "Cler_Big": ("MpWt_Rot", 200, 58), "cncl_big": ("MpWt_Rot", 315, 58), "done_big": ("MpWt_Rot", 85, 57),
     "MMB_Note": ("MpWt_Rot", 18, 18), "MMB_Skull": ("MpWt_Rot", 18, 45), "MMB_Chest": ("MpWt_Rot", 18, 72),
     "Sm_RightArrow": ("MultiMove_Base", 168, 56),
+    # matched into the vanilla panels (they agree with ROUND_PANEL_SPOTS)
+    "MultiPlay_UP": ("MultiMove_Base", 166, 54), "MultiPlay_DWN": ("MultiMove_Base", 166, 54),
+    "M_UpBut": ("Mess_Rot", 364, 15), "M_DnBut": ("Mess_Rot", 364, 58),
+    "MP_KICK": ("MP_KickBanRotWindow", 90, 33), "MP_BAN": ("MP_KickBanRotWindow", 259, 33),
     "Char_Minus": ("Char_Maint", 170, 117), "Char_Plus": ("Char_Maint", 224, 117),
     "Char_HTFTMinus": ("Char_Maint", 408, 143), "Char_HTFTPlus": ("Char_Maint", 464, 143),
     "Big_Grn_L": ("CreateCharacterBase", 43, 77), "Big_Grn_R": ("CreateCharacterBase", 244, 77),
@@ -2701,6 +2719,22 @@ KEY_OUTLINE = {"Skills_Button", "char_Common_Skills"}
 KEY_OUTLINE_DIM = 0.4
 KEY_OUTLINE_WIDTH = 3.0
 ICON_NO_SHIFT = {"MP_BAN"}  # its faint up-frame ring isn't found whole
+# User pick (2026-10-01, after the comparison/button_fit/ sheets): these keep
+# their pre-round-8 HD art (crisp, icons where the upscale put them) with only
+# the checker glow redrawn: hd-dither-buttons skips the face rebuild and icon
+# shift for them. hd-round-buttons / hd-button-face still seat them in their
+# sockets. M_UpBut/M_DnBut are not face-only: their gold rim is their own,
+# Mess_Rot's painted socket is bronze.
+ICON_STAY = set(
+    "SkilAddBut SkilMinusBut SldrButt_L_Arrow SldrButt_R_Arrow Cler_Big cncl_big done_big Sm_RightArrow "
+    "MMB_Chest MMB_Note MMB_Skull MultiPlay_UP MultiPlay_DWN M_UpBut M_DnBut MP_BAN MP_KICK "
+    "Char_Minus Char_Plus Char_HTFTMinus Char_HTFTPlus Big_Grn_L Big_Grn_R "
+    # 2026-10-02: the HUD / charedit category buttons too (their rebuilt faces broke)
+    "Combat_Button Skills_Button Spells_Button Schematics_Button char_Common_Skills char_Tech_Skills "
+    "char_Spells_Skills "
+    # 2026-10-02 playtest: jaggy outline / highlight from the face rebuild
+    "BackBut NextBut TakeAllButt".split()
+)
 
 
 def _dg_frames(name: str) -> list[tuple[int, int, np.ndarray, np.ndarray]]:
@@ -3037,8 +3071,8 @@ def cmd_hd_dither_buttons(only: str | None = None) -> None:
             frames = [(r, f, _dg_key_donor(c, k, *donor[f], shield), k) for r, f, c, k in frames]
         face = None
         shifts: dict[int, tuple[int, int]] = {}
-        if name in DITHER_FACE:
-            b0 = np.asarray(Image.open(base_dir / f"r{frames[0][0]}_f{frames[0][1]}.png").convert("RGBA"), dtype=np.float32)
+        if name in DITHER_FACE and name not in ICON_STAY:
+            b0 =np.asarray(Image.open(base_dir / f"r{frames[0][0]}_f{frames[0][1]}.png").convert("RGBA"), dtype=np.float32)
             fx, fy, fg = FACE_CIRCLE.get(name) or _dg_face(b0)
             face = (fx / HD_SCALE, fy / HD_SCALE, fg / HD_SCALE)
             icons = {f: _dg_icon(c, k, *face) for r, f, c, k in frames}
@@ -3075,7 +3109,7 @@ def cmd_hd_dither_buttons(only: str | None = None) -> None:
             if corr < BATCH_OUTPUT_MIN_CORR:
                 raise RuntimeError(f"{DITHER_MODEL} output doesn't match {name} f{frame} (corr {corr:.2f})")
             disc = 1.0
-            if name in ICON_DISC:
+            if name in ICON_DISC and face is not None:
                 # one circle for every frame: the lit hover's (the dark
                 # resting dot is not found whole)
                 if disc_icon is None:
@@ -3121,7 +3155,18 @@ def cmd_hd_dither_buttons(only: str | None = None) -> None:
                     o[..., :3] = np.where(hole[..., None], bg, rgb) + ndimage.shift(layer, (sh[1], sh[0], 0), order=1, mode="constant")
                     moved.append((rot, frame, o))
                 built = moved
-        if name in KEY_OUTLINE:
+        spot = next(((x, y, r) for n_, x, y, r in ROUND_ART_SPOTS if n_ == name), None)
+        if spot is not None and len(built) > 1:
+            # button + picture arts (the map buttons): only the button
+            # changes with the state; the picture, upscaled per frame, came
+            # out a little different in each (2026-10-02 playtest), so every
+            # frame takes the first frame's picture
+            sx, sy, sr = spot
+            h0, w0 = built[0][2].shape[:2]
+            yy, xx = np.mgrid[:h0, :w0] + 0.5
+            inside = np.clip(sr + 8 - np.hypot(xx - sx, yy - sy), 0, 1)[..., None]
+            built = [built[0]] + [(r, f, o * inside + built[0][2] * (1 - inside)) for r, f, o in built[1:]]
+        if name in KEY_OUTLINE and face is not None:
             built = [(r, f, _key_outline(o, face)) for r, f, o in built]
         for rot, frame, out in built:
             img = Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8), "RGBA")
@@ -3129,7 +3174,7 @@ def cmd_hd_dither_buttons(only: str | None = None) -> None:
             if rb.exists():
                 img.save(rb / f"r{rot}_f{frame}.png")
         extra = (", icon shifts " + " ".join(f"f{f}{s}" for f, s in sorted(shifts.items()))) if shifts else ""
-        print(f"{name}: checker glow redrawn ({DITHER_MODEL}){extra}" + ("; run hd-round-buttons" if rb.exists() else ""))
+        print(f"{name}: checker glow redrawn ({DITHER_MODEL}){extra}" + ("; run hd-round-buttons" if rb.exists() and name not in ICON_STAY else ""))
 
 
 # Buttons cut out of a panel that paints the same button (vanilla art =
@@ -3145,12 +3190,15 @@ def cmd_hd_dither_buttons(only: str | None = None) -> None:
 # hd-round-buttons (which rewrites these from work/_round_originals/).
 BUTTON_FACE_ONLY = (
     "SkilAddBut SkilMinusBut SldrButt_L_Arrow SldrButt_R_Arrow Cler_Big cncl_big done_big "
-    "MMB_Chest MMB_Note MMB_Skull Sm_RightArrow MultiPlay_UP MultiPlay_DWN M_UpBut M_DnBut "
+    "MMB_Chest MMB_Note MMB_Skull Sm_RightArrow MultiPlay_UP MultiPlay_DWN "
     "MP_BAN MP_KICK Char_Minus Char_Plus Char_HTFTMinus Char_HTFTPlus Big_Grn_L Big_Grn_R "
     "BGRN_BUT LilGrnBut Combat_Button Skills_Button Spells_Button Schematics_Button "
     "char_Common_Skills char_Tech_Skills char_Spells_Skills"
 ).split()
 BUTTON_FACE_EDGE = 1.5
+FACE_HOLE_FILL = {"IntBotom"}
+FACE_HOLE_REACH = 10.0          # HD px past the face circle
+FACE_HOLE_COLOUR = (10, 8, 5)   # the groove's dark
 
 
 def cmd_hd_button_face(only: str | None = None) -> None:
@@ -3170,6 +3218,26 @@ def cmd_hd_button_face(only: str | None = None) -> None:
             a[..., 3] = np.minimum(a[..., 3], circle * 255)
             Image.fromarray((a + 0.5).astype(np.uint8), "RGBA").save(f)
         print(f"{name}: face only (centre {cx:.1f},{cy:.1f}, r {g0 + BUTTON_FACE_EDGE:.1f})")
+    # Host panels whose socket hole is transparent past the face cut: the
+    # engine's backdrop showed as a blue crescent between ring and face
+    # (2026-10-02). The hole is made an opaque dark groove up to the ring.
+    for name in BUTTON_FACE_ONLY:
+        if name not in BUTTON_HOSTS or BUTTON_HOSTS[name][0] not in FACE_HOLE_FILL:
+            continue
+        if only is not None and only.lower() != name.lower():
+            continue
+        panel, bx, by = BUTTON_HOSTS[name]
+        pf = hd_out_dir(f"art/interface/{panel}.ART") / "r0_f0.png"
+        p = np.asarray(Image.open(pf).convert("RGBA"), dtype=np.float32)
+        fx, fy, fg = FACE_CIRCLE[name]
+        yy, xx = np.mgrid[:p.shape[0], :p.shape[1]] + 0.5
+        hole = np.clip(fg + FACE_HOLE_REACH + 0.5 - np.hypot(xx - bx * HD_SCALE - fx, yy - by * HD_SCALE - fy), 0, 1)
+        al = p[..., 3:] / 255
+        groove = np.asarray(FACE_HOLE_COLOUR, np.float32)
+        p[..., :3] = p[..., :3] * al + groove * (1 - al)
+        p[..., 3] = np.maximum(p[..., 3], hole * 255)
+        Image.fromarray(np.clip(p + 0.5, 0, 255).astype(np.uint8), "RGBA").save(pf)
+        print(f"{panel}: socket hole under {name} made opaque")
 
 
 # Free-standing round buttons (their art has its own rim; nothing painted
@@ -3180,7 +3248,10 @@ def cmd_hd_button_face(only: str | None = None) -> None:
 # hd-round-buttons (rewrites these from work/_round_originals/).
 BUTTON_CUT = (
     "Anatomical_But Chemistry_But Electrical_But Explosives_But GunSmithy_But Mechanical_But Smithy_But "
-    "Therapeutics_But Combat_But Thieving_But Social_But Technological_But PD_lil_butt Inven_lil_butt tiny_butt"
+    "Therapeutics_But Combat_But Thieving_But Social_But Technological_But PD_lil_butt Inven_lil_butt tiny_butt "
+    # 2026-10-02: the rim pass cut these outside the gold ring (shadow averaged in), uneven band
+    "S_Air S_Conveyance S_Divination S_Earth S_EvilNecro S_Fire S_Forc S_GoodNecro S_Mental S_Meta S_Nature "
+    "S_Summoning S_Temporal S_Water s_morph s_phantasm MMB_Ques"
 ).split()
 # Panels that paint a black hole under such a button, ragged and wider than
 # its rim: the hole's dark pixels outside the button's circle are filled
@@ -3189,7 +3260,11 @@ PANEL_HOLES = {
     "Skills_Window": [("Combat_But", 21, 17), ("Thieving_But", 75, 17), ("Social_But", 129, 17),
                       ("Technological_But", 185, 17)],
 }
+# Rims clipped flat by their art box and not gold (the cut's rim fit fails):
+# only the alpha is trimmed to the circle inscribed in the box.
+BUTTON_BOX_ROUND = ["CombineButt", "MapTravelBut"]
 PANEL_HOLE_REACH = 16.0   # HD px past the button's circle
+PANEL_HOLE_DARK = 0.9     # darker than this share of the panel around the spot
 BUTTON_SHADOW_OFFSET = (2.5, 3.5)   # HD px, down-right like vanilla's
 BUTTON_SHADOW_BLUR = 2.5
 BUTTON_SHADOW_ALPHA = 0.55
@@ -3241,6 +3316,10 @@ def cmd_hd_button_cut(only: str | None = None) -> None:
         a0 = np.asarray(Image.open(files[0]).convert("RGBA"), dtype=np.float32)
         cx, cy, e = _bc_rim(a0)
         h, w = a0.shape[:2]
+        if e > min(cx, cy, w - cx, h - cy) - 1 + 3:
+            # the art box clips the ring (flat sides in vanilla too): the
+            # fit runs off, so the circle inscribed in the box
+            cx, cy, e = w / 2, h / 2, min(e, min(w, h) / 2 - 1)
         yy, xx = np.mgrid[:h, :w] + 0.5
         ab = np.clip(e + 0.5 - np.hypot(xx - cx, yy - cy), 0, 1)
         disc = (np.hypot(xx - cx - BUTTON_SHADOW_OFFSET[0], yy - cy - BUTTON_SHADOW_OFFSET[1]) < e).astype(np.float32)
@@ -3252,6 +3331,17 @@ def cmd_hd_button_cut(only: str | None = None) -> None:
             Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8), "RGBA").save(f)
         print(f"{name}: cut at r {e:.1f} (centre {cx:.1f},{cy:.1f}), soft shadow")
         circles[name] = (cx, cy, e)
+    for name in BUTTON_BOX_ROUND:
+        if only is not None and only.lower() != name.lower():
+            continue
+        for f in sorted(hd_out_dir(f"art/interface/{name}.ART").glob("r*_f*.png")):
+            a = np.asarray(Image.open(f).convert("RGBA"), dtype=np.float32)
+            h, w = a.shape[:2]
+            yy, xx = np.mgrid[:h, :w] + 0.5
+            c = np.clip(min(w, h) / 2 - 1 + 0.5 - np.hypot(xx - w / 2, yy - h / 2), 0, 1)
+            a[..., 3] = np.minimum(a[..., 3], c * 255)
+            Image.fromarray(np.clip(a + 0.5, 0, 255).astype(np.uint8), "RGBA").save(f)
+        print(f"{name}: rounded inside its art box")
     import cv2
     for panel, spots in PANEL_HOLES.items():
         if only is not None and not any(only.lower() == n.lower() for n, _, _ in spots):
@@ -3267,8 +3357,18 @@ def cmd_hd_button_cut(only: str | None = None) -> None:
                 circles[n] = _bc_rim(a0)
             cx, cy, e = circles[n]
             rr = np.hypot(xx - bx * HD_SCALE - cx, yy - by * HD_SCALE - cy)
-            dark = ndimage.gaussian_filter(p[..., :3].mean(-1), 1.0) < 40
-            hole |= (rr > e - 3) & (rr < e + PANEL_HOLE_REACH) & dark
+            lum = ndimage.gaussian_filter(p[..., :3].mean(-1), 1.0)
+            # dark against this spot's own panel level: a fixed cut left the
+            # hole's soft edge as a black ring on the darker panels
+            level = np.median(lum[(rr > e + PANEL_HOLE_REACH) & (rr < e + PANEL_HOLE_REACH + 10)])
+            dark = lum < PANEL_HOLE_DARK * level
+            # only dark pixels joined to the hole itself: the panel's own dark
+            # texture spots inside the reach were smeared into grey smudges
+            near = (rr < e + PANEL_HOLE_REACH) & (dark | (rr < e))
+            lab, _ = ndimage.label(near)
+            keep = np.unique(lab[(rr < e) & near])
+            # the part under the button too, or the fill pulls its black in
+            hole |= (rr < e) | np.isin(lab, keep[keep > 0])
         hole = ndimage.binary_dilation(hole, iterations=2)
         rgb8 = np.ascontiguousarray(np.clip(p[..., :3] + 0.5, 0, 255).astype(np.uint8))
         p[..., :3] = cv2.inpaint(rgb8, hole.astype(np.uint8) * 255, 6, cv2.INPAINT_TELEA)
